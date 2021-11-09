@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/datadriven"
 	"github.com/cockroachdb/pebble/internal/keyspan"
@@ -51,6 +52,10 @@ func runBuildCmd(
 			if err != nil {
 				return nil, nil, err
 			}
+		case "filter":
+			writerOpts.FilterPolicy = bloom.FilterPolicy(10)
+		case "comparer-split-4b-suffix":
+			writerOpts.Comparer = test4bSuffixComparer
 		default:
 			return nil, nil, errors.Errorf("%s: unknown arg %s", td.Cmd, arg.Key)
 		}
@@ -108,7 +113,7 @@ func runBuildCmd(
 	if err != nil {
 		return nil, nil, err
 	}
-	readerOpts := ReaderOptions{}
+	readerOpts := ReaderOptions{Comparer: writerOpts.Comparer}
 	if writerOpts.FilterPolicy != nil {
 		readerOpts.Filters = map[string]FilterPolicy{
 			writerOpts.FilterPolicy.Name(): writerOpts.FilterPolicy,
