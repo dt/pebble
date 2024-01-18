@@ -378,7 +378,7 @@ func TestBlockSyntheticPrefix(t *testing.T) {
 				expect, err := newBlockIter(bytes.Compare, includedPrefixBlock, nil)
 				require.NoError(t, err)
 
-				got, err := newBlockIter(bytes.Compare, elidedPrefixBlock, &SyntheticPrefix{[]byte(prefix)})
+				got, err := newBlockIter(bytes.Compare, elidedPrefixBlock, SyntheticPrefix([]byte(prefix)))
 				require.NoError(t, err)
 
 				check := func(eKey *base.InternalKey, eVal base.LazyValue) func(gKey *base.InternalKey, gVal base.LazyValue) {

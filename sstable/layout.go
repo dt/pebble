@@ -36,7 +36,7 @@ type Layout struct {
 	MetaIndex       BlockHandle
 	Footer          BlockHandle
 	Format          TableFormat
-	SyntheticPrefix *SyntheticPrefix
+	SyntheticPrefix SyntheticPrefix
 }
 
 // Describe returns a description of the layout. If the verbose parameter is

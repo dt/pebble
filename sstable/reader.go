@@ -168,23 +168,21 @@ func WithSyntheticPrefix(prefix []byte) ReaderOption {
 	if len(prefix) == 0 {
 		return noopOpt{}
 	}
-	return &SyntheticPrefix{prefix}
+	return SyntheticPrefix(prefix)
 }
 
-type SyntheticPrefix struct {
-	prefix []byte
-}
+type SyntheticPrefix []byte
 
-func (p *SyntheticPrefix) Implements(r *manifest.PrefixReplacement) bool {
+func (p SyntheticPrefix) Implements(r *manifest.PrefixReplacement) bool {
 	if p == nil {
 		return r == nil || (len(r.ContentPrefix) == 0 && len(r.SyntheticPrefix) == 0)
 	}
-	return len(r.ContentPrefix) == 0 && bytes.Equal(r.SyntheticPrefix, p.prefix)
+	return len(r.ContentPrefix) == 0 && bytes.Equal(r.SyntheticPrefix, p)
 }
 
 func (SyntheticPrefix) preApply() {}
 
-func (p *SyntheticPrefix) readerApply(r *Reader) {
+func (p SyntheticPrefix) readerApply(r *Reader) {
 	r.syntheticPrefix = p
 }
 
@@ -253,7 +251,7 @@ type Reader struct {
 	Equal             Equal
 	FormatKey         base.FormatKey
 	Split             Split
-	syntheticPrefix   *SyntheticPrefix
+	syntheticPrefix   SyntheticPrefix
 	tableFilter       *tableFilterReader
 	// Keep types that are not multiples of 8 bytes at the end and with
 	// decreasing size.

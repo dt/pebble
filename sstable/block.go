@@ -411,13 +411,13 @@ type blockIter struct {
 		hasValuePrefix bool
 	}
 	hideObsoletePoints bool
-	*SyntheticPrefix
+	SyntheticPrefix
 }
 
 // blockIter implements the base.InternalIterator interface.
 var _ base.InternalIterator = (*blockIter)(nil)
 
-func newBlockIter(cmp Compare, block block, syntheticPrefix *SyntheticPrefix) (*blockIter, error) {
+func newBlockIter(cmp Compare, block block, syntheticPrefix SyntheticPrefix) (*blockIter, error) {
 	i := &blockIter{}
 	return i, i.init(cmp, block, 0, false, syntheticPrefix)
 }
@@ -427,7 +427,7 @@ func (i *blockIter) String() string {
 }
 
 func (i *blockIter) init(
-	cmp Compare, block block, globalSeqNum uint64, hideObsoletePoints bool, syntheticPrefix *SyntheticPrefix,
+	cmp Compare, block block, globalSeqNum uint64, hideObsoletePoints bool, syntheticPrefix SyntheticPrefix,
 ) error {
 	numRestarts := int32(binary.LittleEndian.Uint32(block[len(block)-4:]))
 	if numRestarts == 0 {
@@ -441,7 +441,7 @@ func (i *blockIter) init(
 	i.ptr = unsafe.Pointer(&block[0])
 	i.data = block
 	if i.SyntheticPrefix != nil {
-		i.fullKey = append(i.fullKey[:0], i.prefix...)
+		i.fullKey = append(i.fullKey[:0], i.SyntheticPrefix...)
 	} else {
 		i.fullKey = i.fullKey[:0]
 	}
@@ -464,7 +464,7 @@ func (i *blockIter) init(
 //     ingested.
 //   - Foreign sstable iteration: globalSeqNum is always set.
 func (i *blockIter) initHandle(
-	cmp Compare, block bufferHandle, globalSeqNum uint64, hideObsoletePoints bool, syntheticPrefix *SyntheticPrefix,
+	cmp Compare, block bufferHandle, globalSeqNum uint64, hideObsoletePoints bool, syntheticPrefix SyntheticPrefix,
 ) error {
 	i.handle.Release()
 	i.handle = block
@@ -564,9 +564,7 @@ func (i *blockIter) readEntry() {
 		ptr = unsafe.Pointer(uintptr(ptr) + 5)
 	}
 
-	if i.SyntheticPrefix != nil {
-		shared += uint32(len(i.SyntheticPrefix.prefix))
-	}
+	shared += uint32(len(i.SyntheticPrefix))
 	unsharedKey := getBytes(ptr, int(unshared))
 	// TODO(sumeer): move this into the else block below.
 	i.fullKey = append(i.fullKey[:shared], unsharedKey...)
@@ -644,7 +642,7 @@ func (i *blockIter) readFirstKey() error {
 		return base.CorruptionErrorf("pebble/table: invalid firstKey in block")
 	}
 	if i.SyntheticPrefix != nil {
-		i.firstUserKey = append(i.SyntheticPrefix.prefix, i.firstUserKey...)
+		i.firstUserKey = append(i.SyntheticPrefix, i.firstUserKey...)
 	}
 	return nil
 }
@@ -708,13 +706,13 @@ func (i *blockIter) SeekGE(key []byte, flags base.SeekGEFlags) (*InternalKey, ba
 
 	searchKey := key
 	if i.SyntheticPrefix != nil {
-		if !bytes.HasPrefix(key, i.SyntheticPrefix.prefix) {
-			if i.cmp(i.SyntheticPrefix.prefix, key) >= 0 {
+		if !bytes.HasPrefix(key, i.SyntheticPrefix) {
+			if i.cmp(i.SyntheticPrefix, key) >= 0 {
 				return i.First()
 			}
 			return nil, base.LazyValue{}
 		}
-		searchKey = key[len(i.SyntheticPrefix.prefix):]
+		searchKey = key[len(i.SyntheticPrefix):]
 	}
 
 	i.clearCache()
@@ -859,13 +857,13 @@ func (i *blockIter) SeekLT(key []byte, flags base.SeekLTFlags) (*InternalKey, ba
 	{
 		searchKey := key
 		if i.SyntheticPrefix != nil {
-			if !bytes.HasPrefix(key, i.SyntheticPrefix.prefix) {
-				if i.cmp(i.SyntheticPrefix.prefix, key) < 0 {
+			if !bytes.HasPrefix(key, i.SyntheticPrefix) {
+				if i.cmp(i.SyntheticPrefix, key) < 0 {
 					return i.Last()
 				}
 				return nil, base.LazyValue{}
 			}
-			searchKey = key[len(i.SyntheticPrefix.prefix):]
+			searchKey = key[len(i.SyntheticPrefix):]
 		}
 
 		// NB: manually inlined sort.Search is ~5% faster.
@@ -1262,7 +1260,7 @@ func (i *blockIter) nextPrefixV3(succKey []byte) (*InternalKey, base.LazyValue) 
 			ptr = unsafe.Pointer(uintptr(ptr) + 5)
 		}
 		if i.SyntheticPrefix != nil {
-			shared += uint32(len(i.SyntheticPrefix.prefix))
+			shared += uint32(len(i.SyntheticPrefix))
 		}
 		// The starting position of the value.
 		valuePtr := unsafe.Pointer(uintptr(ptr) + uintptr(unshared))

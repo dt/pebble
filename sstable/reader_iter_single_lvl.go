@@ -823,7 +823,7 @@ func (i *singleLevelIterator) seekPrefixGE(
 			return nil, base.LazyValue{}
 		}
 		if i.reader.syntheticPrefix != nil {
-			prefix = bytes.TrimPrefix(prefix, i.reader.syntheticPrefix.prefix)
+			prefix = bytes.TrimPrefix(prefix, i.reader.syntheticPrefix)
 		}
 		mayContain := i.reader.tableFilter.mayContain(dataH.Get(), prefix)
 		dataH.Release()
