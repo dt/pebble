@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/invariants"
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/internal/treeprinter"
+	"github.com/cockroachdb/pebble/sstable/blockiter"
 	"github.com/stretchr/testify/require"
 )
 
@@ -249,6 +250,163 @@ func TestPrefixBytesBuilder_UnsafeGet(t *testing.T) {
 			prevPrevKey = prevKey
 			prevKey = k
 		}
+	}
+}
+
+// TestPrefixBytesBlockPrefixSubstitution verifies that PrefixBytesIter
+// correctly applies a BlockPrefixSubstitution: every key emitted should have
+// its leading Src bytes replaced by Dst.
+func TestPrefixBytesBlockPrefixSubstitution(t *testing.T) {
+	// Each test case lists the source keys (which all share the source prefix
+	// at the start), the substitution to apply, and the expected output keys.
+	type testCase struct {
+		name     string
+		src      []byte
+		dst      []byte
+		keys     [][]byte
+		expected [][]byte
+	}
+	cases := []testCase{
+		{
+			name: "equal-length-prefix",
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/4/"),
+			keys: [][]byte{
+				[]byte("/tenant/1/aaaa"),
+				[]byte("/tenant/1/aaab"),
+				[]byte("/tenant/1/aabbcc"),
+				[]byte("/tenant/1/abcdef"),
+				[]byte("/tenant/1/zzzz"),
+			},
+			expected: [][]byte{
+				[]byte("/tenant/4/aaaa"),
+				[]byte("/tenant/4/aaab"),
+				[]byte("/tenant/4/aabbcc"),
+				[]byte("/tenant/4/abcdef"),
+				[]byte("/tenant/4/zzzz"),
+			},
+		},
+		{
+			name: "longer-dst",
+			src:  []byte("/t/1/"),
+			dst:  []byte("/tenant/very-long-name/"),
+			keys: [][]byte{
+				[]byte("/t/1/foo"),
+				[]byte("/t/1/foobar"),
+				[]byte("/t/1/zzz"),
+			},
+			expected: [][]byte{
+				[]byte("/tenant/very-long-name/foo"),
+				[]byte("/tenant/very-long-name/foobar"),
+				[]byte("/tenant/very-long-name/zzz"),
+			},
+		},
+		{
+			name: "shorter-dst",
+			src:  []byte("/tenant/12345/"),
+			dst:  []byte("/t/9/"),
+			keys: [][]byte{
+				[]byte("/tenant/12345/aaa"),
+				[]byte("/tenant/12345/aab"),
+				[]byte("/tenant/12345/zzz"),
+			},
+			expected: [][]byte{
+				[]byte("/t/9/aaa"),
+				[]byte("/t/9/aab"),
+				[]byte("/t/9/zzz"),
+			},
+		},
+		{
+			name: "spans-multiple-bundles",
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/9/"),
+			keys: func() [][]byte {
+				keys := make([][]byte, 40) // > 1 bundle (default 16) and > 2 bundles
+				for i := range keys {
+					keys[i] = fmt.Appendf(nil, "/tenant/1/key%04d", i)
+				}
+				return keys
+			}(),
+			expected: func() [][]byte {
+				keys := make([][]byte, 40)
+				for i := range keys {
+					keys[i] = fmt.Appendf(nil, "/tenant/9/key%04d", i)
+				}
+				return keys
+			}(),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, len(tc.keys), len(tc.expected))
+
+			// Build the PrefixBytes column.
+			var pbb PrefixBytesBuilder
+			pbb.Init(16)
+			for i, k := range tc.keys {
+				shared := 0
+				if i > 0 {
+					shared = crbytes.CommonPrefix(tc.keys[i-1], k)
+				}
+				pbb.Put(k, shared)
+			}
+			n := len(tc.keys)
+			size := pbb.Size(n, 0)
+			buf := make([]byte, size+1)
+			require.Equal(t, size, pbb.Finish(0, n, 0, buf))
+			pb, _ := DecodePrefixBytes(buf, 0, uint32(n))
+
+			// The stored block-shared prefix must contain Src as a prefix; this
+			// is the precondition that VirtualClone's bounds analysis guarantees
+			// in production.
+			require.True(t, bytes.HasPrefix(pb.SharedPrefix(), tc.src),
+				"stored shared prefix %q does not start with src %q", pb.SharedPrefix(), tc.src)
+
+			// First, baseline: iterate without substitution and verify we get
+			// the original keys back.
+			var pbi PrefixBytesIter
+			maxLen := 0
+			for _, k := range tc.keys {
+				if len(k) > maxLen {
+					maxLen = len(k)
+				}
+			}
+			pbi.Init(maxLen, nil, blockiter.BlockPrefixSubstitution{})
+			for i := 0; i < n; i++ {
+				if i == 0 {
+					pb.SetAt(&pbi, i)
+				} else {
+					pb.SetNext(&pbi)
+				}
+				require.Equal(t, string(tc.keys[i]), string(pbi.Buf),
+					"baseline iteration mismatch at row %d", i)
+			}
+
+			// Now iterate with substitution and verify keys come out transformed.
+			sub := blockiter.BlockPrefixSubstitution{Src: tc.src, Dst: tc.dst}
+			subMaxLen := maxLen + len(tc.dst) // overestimate, always safe
+			pbi.Init(subMaxLen, nil, sub)
+			for i := 0; i < n; i++ {
+				if i == 0 {
+					pb.SetAt(&pbi, i)
+				} else {
+					pb.SetNext(&pbi)
+				}
+				require.Equal(t, string(tc.expected[i]), string(pbi.Buf),
+					"substituted iteration mismatch at row %d (got %q)", i, pbi.Buf)
+			}
+
+			// SetAt by random index (not just sequential) should also work.
+			for _, i := range []int{n - 1, 0, n / 2, n - 2, 1} {
+				if i >= n {
+					continue
+				}
+				pb.SetAt(&pbi, i)
+				require.Equal(t, string(tc.expected[i]), string(pbi.Buf),
+					"SetAt(%d) substituted mismatch (got %q)", i, pbi.Buf)
+			}
+		})
 	}
 }
 

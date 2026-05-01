@@ -23,6 +23,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/treeprinter"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/blockiter"
+	"github.com/stretchr/testify/require"
 )
 
 var testKeysSchema = DefaultKeySchema(testkeys.Comparer, 16)
@@ -518,6 +519,184 @@ func TestDataBlockIterSeekPrefixGENextWithSamePrefix(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDataBlockIterBlockPrefixSubstitution exercises DataBlockIter end-to-end
+// with a BlockPrefixSubstitution: keys are stored with a source prefix, the
+// iterator is configured to substitute that source prefix with a destination
+// prefix, and we verify SeekGE/Next/First/Last all operate correctly in the
+// destination key space.
+func TestDataBlockIterBlockPrefixSubstitution(t *testing.T) {
+	type testCase struct {
+		name string
+		src  []byte
+		dst  []byte
+	}
+	cases := []testCase{
+		{name: "equal-length", src: []byte("/tenant/1/"), dst: []byte("/tenant/4/")},
+		{name: "longer-dst", src: []byte("/t/1/"), dst: []byte("/tenant/very-long-name/")},
+		{name: "shorter-dst", src: []byte("/tenant/12345/"), dst: []byte("/t/9/")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Build a data block of keys all sharing tc.src as a prefix, plus a
+			// testkeys-style suffix so the comparer is happy.
+			keysWithSrc := make([][]byte, 32)
+			keysWithDst := make([][]byte, 32)
+			for i := range keysWithSrc {
+				suffix := fmt.Sprintf("key%04d@1000", i)
+				keysWithSrc[i] = append(append([]byte(nil), tc.src...), []byte(suffix)...)
+				keysWithDst[i] = append(append([]byte(nil), tc.dst...), []byte(suffix)...)
+			}
+			slices.SortFunc(keysWithSrc, testkeys.Comparer.Compare)
+			slices.SortFunc(keysWithDst, testkeys.Comparer.Compare)
+
+			var w DataBlockEncoder
+			w.Init(&testKeysSchema, NoTieringColumns())
+			for j, k := range keysWithSrc {
+				ik := base.MakeInternalKey(k, base.SeqNum(1000+j), base.InternalKeyKindSet)
+				kcmp := w.KeyWriter.ComparePrev(ik.UserKey)
+				vp := block.InPlaceValuePrefix(kcmp.PrefixEqual())
+				w.Add(ik, []byte("v"), vp, kcmp, false /* isObsolete */, base.KVMeta{})
+			}
+			blockData, _ := w.Finish(w.Rows(), w.Size())
+
+			var r DataBlockDecoder
+			bd := r.Init(&testKeysSchema, blockData)
+
+			// Configure transforms with the substitution.
+			transforms := blockiter.Transforms{
+				BlockPrefixSubstitution: blockiter.BlockPrefixSubstitution{
+					Src: tc.src,
+					Dst: tc.dst,
+				},
+			}
+
+			var it DataBlockIter
+			it.InitOnce(&testKeysSchema, testkeys.Comparer,
+				getInternalValuer(func([]byte) base.InternalValue {
+					return base.MakeInPlaceValue(nil)
+				}), NoTieringColumns())
+			require.NoError(t, it.Init(&r, bd, transforms, NoTieringColumns()))
+			defer it.Close()
+
+			// First()/Next() walk should produce keys in destination space.
+			kv := it.First()
+			for i := 0; i < len(keysWithDst); i++ {
+				require.NotNil(t, kv, "First/Next returned nil at i=%d", i)
+				require.Equal(t, string(keysWithDst[i]), string(kv.K.UserKey),
+					"First/Next mismatch at i=%d", i)
+				kv = it.Next()
+			}
+			require.Nil(t, kv, "iterator should be exhausted after %d Next calls", len(keysWithDst))
+
+			// SeekGE in destination space should find the right row.
+			for _, i := range []int{0, 1, len(keysWithDst) / 2, len(keysWithDst) - 1} {
+				kv := it.SeekGE(keysWithDst[i], base.SeekGEFlagsNone)
+				require.NotNil(t, kv, "SeekGE(%q) returned nil", keysWithDst[i])
+				require.Equal(t, string(keysWithDst[i]), string(kv.K.UserKey),
+					"SeekGE(%q) returned wrong key", keysWithDst[i])
+			}
+
+			// SeekGE for a key just below the destination range — should land at
+			// the first key.
+			belowDst := append([]byte{}, tc.dst...)
+			belowDst[len(belowDst)-1]-- // decrement last byte to be just below
+			kv = it.SeekGE(belowDst, base.SeekGEFlagsNone)
+			require.NotNil(t, kv, "SeekGE(belowDst) returned nil")
+			require.Equal(t, string(keysWithDst[0]), string(kv.K.UserKey),
+				"SeekGE(belowDst) should land at first key")
+
+			// SeekGE for a key past the destination range — should return nil.
+			aboveDst := append([]byte{}, tc.dst...)
+			aboveDst[len(aboveDst)-1]++ // increment last byte to be just above
+			kv = it.SeekGE(aboveDst, base.SeekGEFlagsNone)
+			require.Nil(t, kv, "SeekGE(aboveDst) should return nil; got %s", kv)
+
+			// SeekLT mid-range should land at the predecessor in destination space.
+			midIdx := len(keysWithDst) / 2
+			kv = it.SeekLT(keysWithDst[midIdx], base.SeekLTFlagsNone)
+			require.NotNil(t, kv, "SeekLT returned nil")
+			require.Equal(t, string(keysWithDst[midIdx-1]), string(kv.K.UserKey),
+				"SeekLT mismatch")
+
+			// IsLowerBound: a key below dst should be a lower bound; a key
+			// after the last destination key should not be.
+			require.True(t, it.IsLowerBound(belowDst),
+				"belowDst should be a lower bound")
+			require.False(t, it.IsLowerBound(aboveDst),
+				"aboveDst should not be a lower bound")
+		})
+	}
+}
+
+// TestDataBlockIterBlockPrefixSubstitutionWithSyntheticSuffix verifies that
+// substitution composes correctly with SyntheticSuffix: substitution touches
+// the leading bytes of each key, SyntheticSuffix replaces the trailing
+// suffix; the two should not interfere.
+func TestDataBlockIterBlockPrefixSubstitutionWithSyntheticSuffix(t *testing.T) {
+	src := []byte("/tenant/1/")
+	dst := []byte("/tenant/4/")
+	syntheticSuffix := []byte("@500")
+
+	keysWithSrc := make([][]byte, 16)
+	for i := range keysWithSrc {
+		// Each key has a unique prefix portion (so suffix replacement is allowed)
+		// and an original suffix that will be replaced.
+		body := fmt.Sprintf("key%04d@1000", i)
+		keysWithSrc[i] = append(append([]byte(nil), src...), []byte(body)...)
+	}
+	slices.SortFunc(keysWithSrc, testkeys.Comparer.Compare)
+
+	// Expected: each key's source prefix swapped to dst, and its suffix
+	// replaced with the synthetic suffix.
+	split := testkeys.Comparer.Split
+	expectedKeys := make([][]byte, len(keysWithSrc))
+	for i, k := range keysWithSrc {
+		// Apply substitution.
+		stripped := k[len(src):]
+		base := append(append([]byte(nil), dst...), stripped...)
+		// Replace suffix.
+		n := split(base)
+		expectedKeys[i] = append(append([]byte(nil), base[:n]...), syntheticSuffix...)
+	}
+
+	var w DataBlockEncoder
+	w.Init(&testKeysSchema, NoTieringColumns())
+	for j, k := range keysWithSrc {
+		ik := base.MakeInternalKey(k, base.SeqNum(1000+j), base.InternalKeyKindSet)
+		kcmp := w.KeyWriter.ComparePrev(ik.UserKey)
+		vp := block.InPlaceValuePrefix(kcmp.PrefixEqual())
+		w.Add(ik, []byte("v"), vp, kcmp, false /* isObsolete */, base.KVMeta{})
+	}
+	blockData, _ := w.Finish(w.Rows(), w.Size())
+
+	var r DataBlockDecoder
+	bd := r.Init(&testKeysSchema, blockData)
+
+	transforms := blockiter.Transforms{
+		BlockPrefixSubstitution: blockiter.BlockPrefixSubstitution{Src: src, Dst: dst},
+		SyntheticPrefixAndSuffix: blockiter.MakeSyntheticPrefixAndSuffix(
+			nil, blockiter.SyntheticSuffix(syntheticSuffix)),
+	}
+
+	var it DataBlockIter
+	it.InitOnce(&testKeysSchema, testkeys.Comparer,
+		getInternalValuer(func([]byte) base.InternalValue {
+			return base.MakeInPlaceValue(nil)
+		}), NoTieringColumns())
+	require.NoError(t, it.Init(&r, bd, transforms, NoTieringColumns()))
+	defer it.Close()
+
+	kv := it.First()
+	for i, expected := range expectedKeys {
+		require.NotNil(t, kv, "First/Next returned nil at i=%d", i)
+		require.Equal(t, string(expected), string(kv.K.UserKey),
+			"composition mismatch at i=%d", i)
+		kv = it.Next()
+	}
+	require.Nil(t, kv, "iterator should be exhausted")
 }
 
 func randSyntheticPrefix(rng *rand.Rand) blockiter.SyntheticPrefix {

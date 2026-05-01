@@ -1156,7 +1156,7 @@ func (v *DataBlockValidator) Validate(
 		v.prevUserKeyBuf = make([]byte, 0, v.dec.maximumKeyLength+1)
 	}
 	prevKey := base.InternalKey{UserKey: v.prevUserKeyBuf[:0]}
-	v.curKeyIter.Init(int(v.dec.maximumKeyLength), nil)
+	v.curKeyIter.Init(int(v.dec.maximumKeyLength), nil, blockiter.BlockPrefixSubstitution{})
 
 	for i := 0; i < int(n); i++ {
 		k := base.InternalKey{
@@ -1264,6 +1264,13 @@ type DataBlockIter struct {
 	// prefixChanged.SeekSetBitGE.
 	prefixCacheStart int
 	nextPrefixChange int
+
+	// seekKeyBuf is a scratch buffer used to translate seek keys from
+	// destination-prefix space to storage-prefix space when a
+	// BlockPrefixSubstitution is in effect. It is reused across Seek calls;
+	// its contents are only valid for the duration of the underlying
+	// keySeeker call.
+	seekKeyBuf []byte
 }
 
 // InitOnce configures the data block iterator's key schema and lazy value
@@ -1308,8 +1315,13 @@ func (i *DataBlockIter) Init(
 	i.keySeeker = i.keySchema.KeySeeker(meta)
 
 	// The worst case is when the largest key in the block has no suffix.
+	// Account for either a SyntheticPrefix (which lengthens keys by PrefixLen)
+	// or a BlockPrefixSubstitution (which can lengthen keys by up to len(Dst)).
 	maxKeyLength := int(i.transforms.SyntheticPrefixAndSuffix.PrefixLen() + d.maximumKeyLength + i.transforms.SyntheticPrefixAndSuffix.SuffixLen())
-	i.keyIter.Init(maxKeyLength, i.transforms.SyntheticPrefix())
+	if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		maxKeyLength += len(sub.Dst)
+	}
+	i.keyIter.Init(maxKeyLength, i.transforms.SyntheticPrefix(), i.transforms.BlockPrefixSubstitution)
 	i.row = -1
 	i.kv = base.InternalKV{}
 	i.kvRow = math.MinInt
@@ -1349,8 +1361,13 @@ func (i *DataBlockIter) InitHandle(
 	i.noTransforms = i.transforms.NoTransforms()
 
 	// The worst case is when the largest key in the block has no suffix.
+	// Account for either a SyntheticPrefix (which lengthens keys by PrefixLen)
+	// or a BlockPrefixSubstitution (which can lengthen keys by up to len(Dst)).
 	maxKeyLength := int(i.transforms.SyntheticPrefixAndSuffix.PrefixLen() + i.d.maximumKeyLength + i.transforms.SyntheticPrefixAndSuffix.SuffixLen())
-	i.keyIter.Init(maxKeyLength, i.transforms.SyntheticPrefix())
+	if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		maxKeyLength += len(sub.Dst)
+	}
+	i.keyIter.Init(maxKeyLength, i.transforms.SyntheticPrefix(), i.transforms.BlockPrefixSubstitution)
 	i.row = -1
 	i.kv = base.InternalKV{}
 	i.kvRow = math.MinInt
@@ -1416,6 +1433,17 @@ func (i *DataBlockIter) IsLowerBound(k []byte) bool {
 		if cmp := bytes.Compare(keyPrefix, i.transforms.SyntheticPrefix()); cmp != 0 {
 			return cmp < 0
 		}
+	} else if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		var keyPrefix []byte
+		keyPrefix, k = splitKey(k, len(sub.Dst))
+		if cmp := bytes.Compare(keyPrefix, sub.Dst); cmp != 0 {
+			return cmp < 0
+		}
+		// Translate from destination-prefix space to storage-prefix space by
+		// prepending Src in place of the (already-stripped) Dst.
+		i.seekKeyBuf = append(i.seekKeyBuf[:0], sub.Src...)
+		i.seekKeyBuf = append(i.seekKeyBuf, k...)
+		k = i.seekKeyBuf
 	}
 	// If we are hiding obsolete points, it is possible that all points < k are
 	// hidden.
@@ -1446,6 +1474,20 @@ func (i *DataBlockIter) seekGEInternal(
 			}
 			return i.maxRow + 1, false
 		}
+	} else if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		var keyPrefix []byte
+		keyPrefix, key = splitKey(key, len(sub.Dst))
+		if cmp := bytes.Compare(keyPrefix, sub.Dst); cmp != 0 {
+			if cmp < 0 {
+				return 0, false
+			}
+			return i.maxRow + 1, false
+		}
+		// Translate from destination-prefix space to storage-prefix space by
+		// prepending Src in place of the (already-stripped) Dst.
+		i.seekKeyBuf = append(i.seekKeyBuf[:0], sub.Src...)
+		i.seekKeyBuf = append(i.seekKeyBuf, key...)
+		key = i.seekKeyBuf
 	}
 	if i.transforms.HasSyntheticSuffix() {
 		n := i.split(key)

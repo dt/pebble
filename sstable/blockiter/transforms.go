@@ -27,6 +27,11 @@ type Transforms struct {
 	HideObsoletePoints bool
 
 	SyntheticPrefixAndSuffix SyntheticPrefixAndSuffix
+
+	// BlockPrefixSubstitution, if set, replaces a leading source prefix with a
+	// destination prefix during key materialization. Mutually exclusive with
+	// SyntheticPrefixAndSuffix's prefix component. See BlockPrefixSubstitution.
+	BlockPrefixSubstitution BlockPrefixSubstitution
 }
 
 // NoTransforms is the default value for Transforms.
@@ -36,7 +41,8 @@ var NoTransforms = Transforms{}
 func (t *Transforms) NoTransforms() bool {
 	return t.SyntheticSeqNum == 0 &&
 		!t.HideObsoletePoints &&
-		t.SyntheticPrefixAndSuffix.IsUnset()
+		t.SyntheticPrefixAndSuffix.IsUnset() &&
+		!t.BlockPrefixSubstitution.IsSet()
 }
 
 func (t *Transforms) HasSyntheticPrefix() bool {
@@ -60,12 +66,15 @@ func (t *Transforms) SyntheticSuffix() []byte {
 type FragmentTransforms struct {
 	SyntheticSeqNum          SyntheticSeqNum
 	SyntheticPrefixAndSuffix SyntheticPrefixAndSuffix
+	BlockPrefixSubstitution  BlockPrefixSubstitution
 }
 
 // NoTransforms returns true if there are no transforms enabled.
 func (t *FragmentTransforms) NoTransforms() bool {
 	// NoTransforms returns true if there are no transforms enabled.
-	return t.SyntheticSeqNum == 0 && t.SyntheticPrefixAndSuffix.IsUnset()
+	return t.SyntheticSeqNum == 0 &&
+		t.SyntheticPrefixAndSuffix.IsUnset() &&
+		!t.BlockPrefixSubstitution.IsSet()
 }
 
 func (t *FragmentTransforms) HasSyntheticPrefix() bool {
@@ -245,4 +254,66 @@ func (ps SyntheticPrefixAndSuffix) RemoveSuffix() SyntheticPrefixAndSuffix {
 		suffixLen: 0,
 		buf:       ps.buf,
 	}
+}
+
+// BlockPrefixSubstitution describes a substitution applied to the block-shared
+// prefix of every colblk data block when reading a virtual sstable. The first
+// len(Src) bytes at the start of the stored block-shared prefix are replaced
+// with Dst during key materialization.
+//
+// Precondition: every block touched by iteration must have a stored shared
+// prefix whose first len(Src) bytes equal Src. For fully-contained virtual
+// SSTs this is guaranteed by the bounds invariant: the LCP of the SST's
+// smallest and largest keys is a superset of any prefix the SST's bounds lie
+// within, and every block's stored shared prefix is itself a superset of
+// LCP(smallest, largest). For block-aligned virtual SSTs over straddling
+// files, the bounds exclude blocks where the precondition would fail.
+//
+// Unlike SyntheticPrefix (which is *prepended* to keys whose backing SST
+// stores them with the prefix already stripped), BlockPrefixSubstitution
+// operates on SSTs whose physically stored keys retain Src as the leading
+// bytes of every key. The substitution is applied once per block at the
+// block-shared-prefix level, not per key, so per-key iteration cost is zero.
+//
+// At seek time, callers in the destination key space must Invert the seek
+// key (replace Dst with Src) before consulting the block's index/search
+// structures; the iterator-emitted keys are produced via Apply.
+type BlockPrefixSubstitution struct {
+	// Src is the byte slice present at the start of every block-shared prefix
+	// in the underlying sstable that this transform is configured to replace.
+	Src []byte
+	// Dst is the byte slice substituted in place of Src.
+	Dst []byte
+}
+
+// IsSet returns true if the substitution is non-empty (either side has bytes).
+func (s BlockPrefixSubstitution) IsSet() bool {
+	return len(s.Src) > 0 || len(s.Dst) > 0
+}
+
+// Apply transforms a storage-space key into a destination-space key by
+// stripping the leading len(Src) bytes (which must equal Src) and prepending
+// Dst.
+func (s BlockPrefixSubstitution) Apply(storedKey []byte) []byte {
+	if !bytes.HasPrefix(storedKey, s.Src) {
+		panic(errors.AssertionFailedf("stored key %q does not have expected source prefix %q", storedKey, s.Src))
+	}
+	res := make([]byte, 0, len(s.Dst)+len(storedKey)-len(s.Src))
+	res = append(res, s.Dst...)
+	res = append(res, storedKey[len(s.Src):]...)
+	return res
+}
+
+// Invert transforms a destination-space key into a storage-space key by
+// stripping the leading len(Dst) bytes (which must equal Dst) and prepending
+// Src.
+func (s BlockPrefixSubstitution) Invert(externalKey []byte) []byte {
+	rest, ok := bytes.CutPrefix(externalKey, s.Dst)
+	if !ok {
+		panic(errors.AssertionFailedf("external key %q does not have expected destination prefix %q", externalKey, s.Dst))
+	}
+	res := make([]byte, 0, len(s.Src)+len(rest))
+	res = append(res, s.Src...)
+	res = append(res, rest...)
+	return res
 }

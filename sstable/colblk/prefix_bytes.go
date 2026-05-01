@@ -250,11 +250,31 @@ func (b *PrefixBytes) UnsafeFirstSlice() []byte {
 // provides a means for efficiently iterating over the []byte slices contained
 // within a PrefixBytes, avoiding unnecessary copying when portions of slices
 // are shared.
+//
+// The iterator can apply two mutually exclusive prepend-style transforms when
+// materializing keys:
+//
+//   - A SyntheticPrefix is prepended to the stored key (which is assumed to
+//     have no source prefix). prependLen = len(syntheticPrefix); skipShared = 0.
+//   - A BlockPrefixSubstitution replaces the leading bytes of the stored
+//     block-shared prefix with new bytes. prependLen = len(substitution.Dst);
+//     skipShared = len(substitution.Src).
+//
+// In both cases the iterator pre-fills Buf with the prepend bytes and, when
+// materializing a key, copies the stored shared prefix starting at offset
+// skipShared.
 type PrefixBytesIter struct {
 	// Buf is used for materializing a user key. It is preallocated to the maximum
 	// key length in the data block.
-	Buf                      []byte
-	syntheticPrefixLen       uint32
+	Buf []byte
+	// prependLen is the number of bytes pre-filled at the start of Buf to
+	// represent either a SyntheticPrefix or the destination half of a
+	// BlockPrefixSubstitution. Zero when no prefix transform is in effect.
+	prependLen uint32
+	// skipShared is the number of bytes to skip at the start of the stored
+	// block-shared prefix when copying into Buf. Non-zero only when a
+	// BlockPrefixSubstitution is in effect.
+	skipShared               uint32
 	sharedAndBundlePrefixLen uint32
 	offsetIndex              int
 	nextBundleOffsetIndex    int
@@ -262,8 +282,17 @@ type PrefixBytesIter struct {
 
 // Init initializes the prefix bytes iterator; maxKeyLength must be
 // large enough to fit any key in the block after applying any synthetic prefix
-// and/or suffix.
-func (i *PrefixBytesIter) Init(maxKeyLength int, syntheticPrefix blockiter.SyntheticPrefix) {
+// and/or suffix or any block prefix substitution.
+//
+// At most one of syntheticPrefix and substitution may be set.
+func (i *PrefixBytesIter) Init(
+	maxKeyLength int,
+	syntheticPrefix blockiter.SyntheticPrefix,
+	substitution blockiter.BlockPrefixSubstitution,
+) {
+	if syntheticPrefix.IsSet() && substitution.IsSet() {
+		panic(errors.AssertionFailedf("PrefixBytesIter: SyntheticPrefix and BlockPrefixSubstitution are mutually exclusive"))
+	}
 	// Allocate a buffer that's large enough to hold the largest user key in the
 	// block with 1 byte to spare (so that pointer arithmetic is never pointing
 	// beyond the allocation, which would violate Go rules).
@@ -273,9 +302,18 @@ func (i *PrefixBytesIter) Init(maxKeyLength int, syntheticPrefix blockiter.Synth
 		i.Buf = unsafe.Slice((*byte)(ptr), n)
 	}
 	i.Buf = i.Buf[:0]
-	i.syntheticPrefixLen = uint32(len(syntheticPrefix))
-	if syntheticPrefix.IsSet() {
+	switch {
+	case syntheticPrefix.IsSet():
+		i.prependLen = uint32(len(syntheticPrefix))
+		i.skipShared = 0
 		i.Buf = append(i.Buf, syntheticPrefix...)
+	case substitution.IsSet():
+		i.prependLen = uint32(len(substitution.Dst))
+		i.skipShared = uint32(len(substitution.Src))
+		i.Buf = append(i.Buf, substitution.Dst...)
+	default:
+		i.prependLen = 0
+		i.skipShared = 0
 	}
 }
 
@@ -299,15 +337,26 @@ func (b *PrefixBytes) SetAt(it *PrefixBytesIter, i int) {
 	rowSuffixStart, rowSuffixEnd := b.rowSuffixOffsets(i, it.offsetIndex)
 	rowSuffixLen := rowSuffixEnd - rowSuffixStart
 
-	it.sharedAndBundlePrefixLen = it.syntheticPrefixLen + uint32(b.sharedPrefixLen) + bundlePrefixLen
+	// effectiveSharedPrefixLen excludes any leading bytes of the stored shared
+	// prefix that are being skipped because of a BlockPrefixSubstitution.
+	if invariants.Enabled && it.skipShared > uint32(b.sharedPrefixLen) {
+		panic(errors.AssertionFailedf("BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d",
+			errors.Safe(it.skipShared), errors.Safe(b.sharedPrefixLen)))
+	}
+	effectiveSharedPrefixLen := uint32(b.sharedPrefixLen) - it.skipShared
+	it.sharedAndBundlePrefixLen = it.prependLen + effectiveSharedPrefixLen + bundlePrefixLen
 	it.Buf = it.Buf[:it.sharedAndBundlePrefixLen+rowSuffixLen]
 
 	ptr := unsafe.Pointer(unsafe.SliceData(it.Buf))
-	ptr = unsafe.Add(ptr, it.syntheticPrefixLen)
-	// Copy the shared key prefix.
-	memmove(ptr, b.rawBytes.data, uintptr(b.sharedPrefixLen))
+	ptr = unsafe.Add(ptr, it.prependLen)
+	// Copy the shared key prefix, skipping the first it.skipShared bytes (which
+	// have been replaced by the prepend region under a BlockPrefixSubstitution).
+	memmove(
+		ptr,
+		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(it.skipShared)),
+		uintptr(effectiveSharedPrefixLen))
 	// Copy the bundle prefix.
-	ptr = unsafe.Add(ptr, b.sharedPrefixLen)
+	ptr = unsafe.Add(ptr, effectiveSharedPrefixLen)
 	memmove(
 		ptr,
 		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(bundleOffsetStart)),
@@ -367,12 +416,13 @@ func (b *PrefixBytes) SetNext(it *PrefixBytesIter) {
 	bundlePrefixLen := rowSuffixStart - bundlePrefixStart
 	it.nextBundleOffsetIndex = it.offsetIndex + (1 << b.bundleShift)
 
-	it.sharedAndBundlePrefixLen = it.syntheticPrefixLen + uint32(b.sharedPrefixLen) + bundlePrefixLen
+	effectiveSharedPrefixLen := uint32(b.sharedPrefixLen) - it.skipShared
+	it.sharedAndBundlePrefixLen = it.prependLen + effectiveSharedPrefixLen + bundlePrefixLen
 	it.Buf = it.Buf[:it.sharedAndBundlePrefixLen+rowSuffixLen]
 	// Copy in the new bundle suffix.
 	ptr := unsafe.Pointer(unsafe.SliceData(it.Buf))
-	ptr = unsafe.Add(ptr, it.syntheticPrefixLen)
-	ptr = unsafe.Add(ptr, b.sharedPrefixLen)
+	ptr = unsafe.Add(ptr, it.prependLen)
+	ptr = unsafe.Add(ptr, effectiveSharedPrefixLen)
 	memmove(
 		ptr,
 		unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(bundlePrefixStart)),
