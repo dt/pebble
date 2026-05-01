@@ -82,7 +82,7 @@ func (d *DB) VirtualClone(
 	}
 
 	for attempt := 0; attempt < virtualCloneMaxRetries; attempt++ {
-		retried, err := d.virtualCloneAttempt(ctx, srcSpan, srcPrefix, dstPrefix)
+		retried, err := d.virtualCloneAttempt(ctx, attempt, srcSpan, srcPrefix, dstPrefix)
 		if err != nil {
 			return err
 		}
@@ -171,7 +171,7 @@ type clonePlanEntry struct {
 
 // virtualCloneAttempt performs one attempt at VirtualClone.
 func (d *DB) virtualCloneAttempt(
-	ctx context.Context, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
+	ctx context.Context, attempt int, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
 ) (retried bool, _ error) {
 	// Before snapshotting the version, check whether any memtable contains keys
 	// overlapping srcSpan. If so, force a flush and wait for it before
@@ -188,6 +188,13 @@ func (d *DB) virtualCloneAttempt(
 	currentVersion.Ref()
 	d.mu.Unlock()
 	defer currentVersion.Unref()
+
+	// Test hook: invoked after the version snapshot has been taken and d.mu
+	// has been released. Tests use this to inject concurrent compactions or
+	// excises into the race window between snapshot and apply.
+	if hook := d.opts.private.testingCloneAfterSnapshot; hook != nil {
+		hook(attempt)
+	}
 
 	srcSpanBounds := srcSpan.UserKeyBounds()
 
@@ -264,6 +271,12 @@ func (d *DB) virtualCloneAttempt(
 	if err := assignClonedFileLevels(d.cmp, currentVersion, entries); err != nil {
 		cleanupPreVE()
 		return false, err
+	}
+
+	// Test hook: invoked just before re-acquiring d.mu and applying the
+	// version edit.
+	if hook := d.opts.private.testingCloneBeforeUpdateVersionLocked; hook != nil {
+		hook(attempt)
 	}
 
 	// Apply via UpdateVersionLocked.

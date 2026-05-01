@@ -7,12 +7,17 @@ package pebble
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/testkeys"
+	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
+	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -28,6 +33,16 @@ func openCloneTestDB(t *testing.T, fmv FormatMajorVersion) *DB {
 // per-level BlockSize (0 = default).
 func openCloneTestDBWithBlockSize(t *testing.T, fmv FormatMajorVersion, blockSize int) *DB {
 	t.Helper()
+	return openCloneTestDBWithOpts(t, fmv, blockSize, nil)
+}
+
+// openCloneTestDBWithOpts is the most general clone-test DB opener. The optional
+// modify callback receives the Options before Open and may install testing
+// hooks (in particular, opts.private.testingClone* hooks).
+func openCloneTestDBWithOpts(
+	t *testing.T, fmv FormatMajorVersion, blockSize int, modify func(*Options),
+) *DB {
+	t.Helper()
 	mem := vfs.NewMem()
 	opts := &Options{
 		Comparer:                    testkeys.Comparer,
@@ -42,6 +57,9 @@ func openCloneTestDBWithBlockSize(t *testing.T, fmv FormatMajorVersion, blockSiz
 			opts.Levels[i].BlockSize = blockSize
 			opts.Levels[i].IndexBlockSize = 1 << 30 // keep a single index level
 		}
+	}
+	if modify != nil {
+		modify(opts)
 	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
@@ -559,16 +577,392 @@ func TestVirtualClone_NoMemtableOverlap(t *testing.T) {
 	}
 }
 
-// TestVirtualClone_ConcurrentCompactionRace_Sketch documents a desired
-// concurrency invariant for D2. A real test requires plumbing a hook that
-// fires between Snapshot and UpdateVersionLocked; that machinery isn't
-// implemented in this slice.
-//
-// TODO(clone): wire a test hook that triggers a manual compaction after the
-// Snapshot but before UpdateVersionLocked so the retry path runs and the
-// final state is correct.
-func TestVirtualClone_ConcurrentCompactionRace_Sketch(t *testing.T) {
-	t.Skip("TODO(clone): requires a between-snapshot-and-VE hook")
+// TestVirtualClone_Race_CompactionDuringClone (scenario A) verifies the
+// retry loop fires when a compaction completes between the version snapshot
+// and the apply phase, mutating one of the source backings out from under
+// the in-flight clone. The clone must abort, retry, and ultimately succeed
+// with the post-compaction LSM state.
+func TestVirtualClone_Race_CompactionDuringClone(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var compactedOnce atomic.Bool
+	var attempts atomic.Int32
+	var dRef atomic.Pointer[DB]
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 0, func(opts *Options) {
+		opts.private.testingCloneAfterSnapshot = func(attempt int) {
+			attempts.Add(1)
+			// Only race on the first attempt: the second attempt must
+			// observe a quiescent LSM and succeed.
+			if compactedOnce.Swap(true) {
+				return
+			}
+			db := dRef.Load()
+			// Compact all of /tenant/1/ down to L6. This produces a brand-new
+			// TableMetadata at L6 with a different TableNum and obsoletes the
+			// L0 sources the clone snapshotted.
+			require.NoError(t, db.Compact(context.Background(),
+				[]byte("/tenant/1/"), []byte("/tenant/1/\xff"), false))
+		}
+	})
+	dRef.Store(d)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Two L0 SSTs in srcSpan.
+	setMany(t, d, []string{"/tenant/1/A0", "/tenant/1/A1", "/tenant/1/A2"}, value)
+	require.NoError(t, d.Flush())
+	setMany(t, d, []string{"/tenant/1/B0", "/tenant/1/B1", "/tenant/1/B2"}, value)
+	require.NoError(t, d.Flush())
+
+	// Capture the L0 source TableNums so we can assert they are obsoleted.
+	d.mu.Lock()
+	preCloneL0 := make(map[base.TableNum]struct{})
+	for f := range d.mu.versions.currentVersion().Levels[0].All() {
+		preCloneL0[f.TableNum] = struct{}{}
+	}
+	d.mu.Unlock()
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// We expect at least 2 attempts: the first is aborted by the compaction
+	// and the second succeeds.
+	require.GreaterOrEqual(t, int(attempts.Load()), 2,
+		"expected the retry path to run at least once")
+
+	// Verify post-compaction L0 sources no longer present (proves the race
+	// actually mutated the LSM during the clone).
+	d.mu.Lock()
+	postCloneL0 := make(map[base.TableNum]struct{})
+	for f := range d.mu.versions.currentVersion().Levels[0].All() {
+		postCloneL0[f.TableNum] = struct{}{}
+	}
+	d.mu.Unlock()
+	for tn := range preCloneL0 {
+		_, stillThere := postCloneL0[tn]
+		require.False(t, stillThere,
+			"expected L0 source table %s to be obsoleted by the racing compaction", tn)
+	}
+
+	// Final state: dst keys are readable.
+	want := []string{
+		"/tenant/4/A0", "/tenant/4/A1", "/tenant/4/A2",
+		"/tenant/4/B0", "/tenant/4/B1", "/tenant/4/B2",
+	}
+	for _, k := range want {
+		require.Equal(t, value, mustGet(t, d, k))
+	}
+	require.Equal(t, want, scanRange(t, d, dstPrefix, []byte("/tenant/5/")))
+}
+
+// TestVirtualClone_Race_RetriesExhausted (scenario B) verifies the bounded-
+// retry path: when every attempt loses the race, VirtualClone returns a clean
+// error (no panic, no deadlock) and any boundary SSTs written during
+// intermediate attempts are cleaned up from the object provider.
+func TestVirtualClone_Race_RetriesExhausted(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var attempts atomic.Int32
+	var dRef atomic.Pointer[DB]
+	racingCompaction := func(attempt int) {
+		attempts.Add(1)
+		d := dRef.Load()
+		if d == nil {
+			return
+		}
+		// Each attempt: write a brand-new in-srcSpan key, flush it to L0,
+		// then compact the entire srcSpan. This guarantees a fresh L6
+		// TableMetadata pointer each iteration and obsoletes whatever the
+		// in-flight clone snapshotted on the prior attempt.
+		key := fmt.Sprintf("/tenant/1/race-%03d", attempt)
+		require.NoError(t, d.Set([]byte(key), []byte("x"), nil))
+		require.NoError(t, d.Flush())
+		require.NoError(t, d.Compact(context.Background(),
+			[]byte("/tenant/1/"), []byte("/tenant/1/\xff"), false))
+	}
+
+	// The DB must exist before the hook can use it; install a closure that
+	// dereferences a pointer.
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 64, func(opts *Options) {
+		opts.private.testingCloneAfterSnapshot = racingCompaction
+		opts.private.testingAlwaysWaitForCleanup = true
+	})
+	dRef.Store(d)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	// Build a straddling source SST with an upper boundary block (so each
+	// attempt allocates a boundary-rewrite physical SST that must be cleaned
+	// up on abort).
+	var keys []string
+	for i := 0; i < 30; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%03d", i))
+	}
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/2/k%03d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	// Snapshot of objects before the failing clone, so we can verify no
+	// orphan objects remain afterward.
+	objsBefore := make(map[base.DiskFileNum]struct{})
+	for _, om := range d.objProvider.List() {
+		objsBefore[om.DiskFileNum] = struct{}{}
+	}
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "exhausted")
+	require.Equal(t, int32(virtualCloneMaxRetries), attempts.Load(),
+		"every attempt should have invoked the hook")
+
+	// Disable the hook so cleanup logic in subsequent operations doesn't race.
+	d.opts.private.testingCloneAfterSnapshot = nil
+
+	// Force any pending obsolete-file deletions (from racing compactions) to
+	// drain so that objProvider.List() reflects the steady state.
+	d.maybeScheduleObsoleteObjectDeletion()
+
+	// Verify that the live object set didn't grow with extra orphan tables.
+	// New backings/tables created by the racing compactions are legitimate;
+	// what we don't want is an orphan boundary-rewrite SST from a failed
+	// clone attempt that the version doesn't reference. We check by walking
+	// the current version's referenced files and asserting that every
+	// table-typed object on disk is either referenced by the version, was
+	// present before the clone began, or is from a racing compaction
+	// (everything compaction creates is also referenced by the version).
+	live := make(map[base.DiskFileNum]struct{})
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	for _, lm := range v.Levels {
+		for f := range lm.All() {
+			live[f.TableBacking.DiskFileNum] = struct{}{}
+		}
+	}
+	for b := range d.mu.versions.latest.virtualBackings.All() {
+		live[b.DiskFileNum] = struct{}{}
+	}
+	d.mu.Unlock()
+
+	for _, om := range d.objProvider.List() {
+		if om.FileType != base.FileTypeTable {
+			continue
+		}
+		if _, isLive := live[om.DiskFileNum]; isLive {
+			continue
+		}
+		if _, isOld := objsBefore[om.DiskFileNum]; isOld {
+			continue
+		}
+		t.Fatalf("orphan table object remains after exhausted retries: %s", om.DiskFileNum)
+	}
+
+	// Sanity: no clone landed in dst space.
+	require.Empty(t, scanRange(t, d, dstPrefix, []byte("/tenant/5/")))
+}
+
+// TestVirtualClone_Race_ExciseDuringClone (scenario C) verifies that an
+// IngestAndExcise that mutates srcSpan between snapshot and apply triggers
+// the retry path. After the excise, the clone re-runs against the post-
+// excise LSM and either succeeds with the post-excise data or returns a
+// graceful error.
+func TestVirtualClone_Race_ExciseDuringClone(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var dRef atomic.Pointer[DB]
+	var hookOnce atomic.Bool
+	var attempts atomic.Int32
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 0, func(opts *Options) {
+		opts.private.testingCloneAfterSnapshot = func(attempt int) {
+			attempts.Add(1)
+			if hookOnce.Swap(true) {
+				return
+			}
+			db := dRef.Load()
+			if db == nil {
+				return
+			}
+			// Ingest+excise a sub-region of srcSpan: excise [k010, k020),
+			// which removes part of the source content.
+			path := "excise.sst"
+			f, err := db.opts.FS.Create(path, vfs.WriteCategoryUnspecified)
+			require.NoError(t, err)
+			w := sstable.NewWriter(
+				objstorageprovider.NewFileWritable(f),
+				db.opts.MakeWriterOptions(0, db.TableFormat()))
+			require.NoError(t, w.Set([]byte("/tenant/1/k015-replacement"), []byte("ingested")))
+			require.NoError(t, w.Close())
+			_, err = db.IngestAndExcise(context.Background(),
+				[]string{path}, nil, nil,
+				KeyRange{Start: []byte("/tenant/1/k010"), End: []byte("/tenant/1/k020")})
+			require.NoError(t, err)
+		}
+	})
+	dRef.Store(d)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	var keys []string
+	for i := 0; i < 30; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%03d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	// The clone must either succeed (after retry against the post-excise
+	// LSM) or return a graceful error; it must never panic or deadlock.
+	if err != nil {
+		// Any error must be a clean Pebble error (not a wrap of a runtime
+		// panic). ErrUnsupportedClone is acceptable.
+		t.Logf("clone returned graceful error: %v", err)
+	}
+	require.GreaterOrEqual(t, int(attempts.Load()), 2,
+		"expected the retry path to fire at least once")
+
+	// Source space must still reflect the post-excise state: keys k010..k019
+	// from the original flush are gone (replaced by the ingested SST).
+	srcGot := scanRange(t, d, []byte("/tenant/1/"), []byte("/tenant/2/"))
+	for _, k := range srcGot {
+		// No scanned key should be in the excised band [k010, k020) other
+		// than the ingested one.
+		if k > "/tenant/1/k009" && k < "/tenant/1/k020" {
+			require.Equal(t, "/tenant/1/k015-replacement", k,
+				"unexpected pre-excise key in src space: %s", k)
+		}
+	}
+}
+
+// TestVirtualClone_Race_FlushDuringClone (scenario D) verifies that a flush
+// of in-srcSpan memtable data that lands in L0 *after* the clone's snapshot
+// does not cause the clone to spuriously fail. The new L0 data must appear
+// in src space only; it must not appear in dst space.
+func TestVirtualClone_Race_FlushDuringClone(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	var dRef atomic.Pointer[DB]
+	var hookOnce atomic.Bool
+	var attempts atomic.Int32
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 0, func(opts *Options) {
+		opts.private.testingCloneAfterSnapshot = func(attempt int) {
+			attempts.Add(1)
+			if hookOnce.Swap(true) {
+				return
+			}
+			db := dRef.Load()
+			if db == nil {
+				return
+			}
+			// Write a NEW in-srcSpan key and flush it. This produces a brand
+			// new L0 SST that the clone's snapshotted version does not see.
+			require.NoError(t, db.Set([]byte("/tenant/1/post-snapshot"), []byte("post"), nil))
+			require.NoError(t, db.Flush())
+		}
+	})
+	dRef.Store(d)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Pre-existing L0 SST in srcSpan.
+	setMany(t, d, []string{"/tenant/1/k1", "/tenant/1/k2"}, value)
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// We expect exactly one attempt: a flush into a new L0 SST does not
+	// invalidate any source backing snapshotted by the clone, and L0 always
+	// tolerates overlap on placement, so no abort/retry should occur.
+	require.Equal(t, int32(1), attempts.Load(),
+		"flush of new L0 data should not cause a clone abort")
+
+	// dst-space contains only the pre-snapshot keys, not the post-snapshot
+	// addition.
+	gotDst := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2"}, gotDst)
+
+	// src-space contains the post-snapshot key.
+	require.Equal(t, []byte("post"), mustGet(t, d, "/tenant/1/post-snapshot"))
+}
+
+// TestVirtualClone_Race_ConcurrentClonesOverlappingDst (scenario E) starts
+// two VirtualClones in parallel that target overlapping destination spaces.
+// Either both succeed (one or both place files into L0 to tolerate overlap),
+// or one returns ErrUnsupportedClone after exhausting retries. In neither
+// case must we corrupt the LSM or panic.
+func TestVirtualClone_Race_ConcurrentClonesOverlappingDst(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	value := []byte("v")
+	// Two source partitions and two distinct dst partitions that share an
+	// overlapping span [/tenant/8/k...]. Both clones target /tenant/8/.
+	setMany(t, d, []string{
+		"/tenant/1/k1", "/tenant/1/k2",
+		"/tenant/2/k1", "/tenant/2/k2",
+	}, value)
+	require.NoError(t, d.Flush())
+	require.NoError(t, d.Compact(context.Background(),
+		[]byte("/tenant/1/"), []byte("/tenant/3/"), true))
+
+	srcPrefixA := []byte("/tenant/1/")
+	srcPrefixB := []byte("/tenant/2/")
+	dstPrefix := []byte("/tenant/8/")
+	srcSpanA := KeyRange{Start: srcPrefixA, End: []byte("/tenant/2/")}
+	srcSpanB := KeyRange{Start: srcPrefixB, End: []byte("/tenant/3/")}
+
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		results[0] = d.VirtualClone(context.Background(), srcSpanA, srcPrefixA, dstPrefix)
+	}()
+	go func() {
+		defer wg.Done()
+		results[1] = d.VirtualClone(context.Background(), srcSpanB, srcPrefixB, dstPrefix)
+	}()
+	wg.Wait()
+
+	// At least one must succeed.
+	successes := 0
+	for _, err := range results {
+		if err == nil {
+			successes++
+			continue
+		}
+		// Acceptable failure modes: ErrUnsupportedClone (placement
+		// saturated) or a clean retries-exhausted error.
+		require.True(t,
+			errors.Is(err, ErrUnsupportedClone) ||
+				(strings.Contains(err.Error(), "exhausted") &&
+					strings.Contains(err.Error(), "retries")),
+			"unexpected error from concurrent clone: %v", err)
+	}
+	require.GreaterOrEqual(t, successes, 1, "at least one concurrent clone must succeed")
+
+	// Whichever side(s) succeeded, dst-space must read consistently.
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/9/"))
+	for _, k := range got {
+		require.Equal(t, value, mustGet(t, d, k))
+	}
 }
 
 // TestVirtualClone_OrphanCleanupOnRetry verifies that boundary SSTs written

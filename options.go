@@ -1228,6 +1228,21 @@ type Options struct {
 		// before calling DB.ingestApply.
 		testingBeforeIngestApplyFunc func()
 
+		// testingCloneAfterSnapshot, when non-nil, is called by VirtualClone
+		// inside each attempt immediately after the version snapshot is taken
+		// (and d.mu has been released), but before any boundary-block reads
+		// take place. The argument is the 0-based attempt index. Used by
+		// tests to deterministically inject concurrent LSM mutations into
+		// the race window between snapshot and version-edit apply.
+		testingCloneAfterSnapshot func(attempt int)
+
+		// testingCloneBeforeUpdateVersionLocked, when non-nil, is called by
+		// VirtualClone inside each attempt immediately before re-acquiring
+		// d.mu and invoking UpdateVersionLocked. The argument is the 0-based
+		// attempt index. Used by tests to inject concurrent LSM mutations
+		// just before the apply phase.
+		testingCloneBeforeUpdateVersionLocked func(attempt int)
+
 		// timeNow returns the current time. It defaults to time.Now. It's
 		// configurable here so that tests can mock the current time.
 		timeNow func() time.Time
