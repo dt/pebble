@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable/blockiter"
 	"github.com/cockroachdb/pebble/sstable/colblk"
+	"github.com/cockroachdb/pebble/sstable/tablefilters/bloom"
 	"github.com/cockroachdb/pebble/sstable/virtual"
 	"github.com/stretchr/testify/require"
 )
@@ -213,4 +214,101 @@ func TestVirtualReaderBlockPrefixSubstitution(t *testing.T) {
 				"key mismatch at i=%d", i)
 		}
 	})
+}
+
+// TestVirtualReaderBloomFilterSubstitution verifies that bloom filter probes
+// are correctly inverted from destination-space (Dst) to storage-space (Src)
+// when a virtual SST carries a BlockPrefixSubstitution. Without inversion, a
+// probe with a Dst key would miss in a filter built over Src keys, producing
+// a false negative.
+func TestVirtualReaderBloomFilterSubstitution(t *testing.T) {
+	src := []byte("/tenant/1/")
+	dst := []byte("/tenant/4/")
+
+	// Build a physical sstable in src space with a bloom filter enabled.
+	// Use a high bits-per-key to keep false positives unlikely for the
+	// negative-case assertions.
+	keysSrc := make([][]byte, 0, 16)
+	for i := 0; i < 16; i++ {
+		keysSrc = append(keysSrc, []byte(fmt.Sprintf("%skey%04d", src, i)))
+	}
+
+	writerOpts := WriterOptions{
+		TableFormat:    TableFormatMax,
+		Comparer:       testkeys.Comparer,
+		BlockSize:      1 << 20, // single data block
+		IndexBlockSize: 1 << 20,
+		FilterPolicy:   bloom.FilterPolicy(100),
+	}
+	keySchema := colblk.DefaultKeySchema(writerOpts.Comparer, 16 /* bundle size */)
+	writerOpts.KeySchema = &keySchema
+
+	obj := &objstorage.MemObj{}
+	w := NewRawWriter(obj, writerOpts)
+	for i, k := range keysSrc {
+		ik := base.MakeInternalKey(k, base.SeqNum(100+i), base.InternalKeyKindSet)
+		require.NoError(t, w.Add(ik, []byte(fmt.Sprintf("v%04d", i)), false /* forceObsolete */, base.KVMeta{}))
+	}
+	require.NoError(t, w.Close())
+
+	r, err := NewMemReader(obj.Data(), ReaderOptions{
+		Comparer:       writerOpts.Comparer,
+		KeySchemas:     KeySchemas{writerOpts.KeySchema.Name: writerOpts.KeySchema},
+		FilterDecoders: []base.TableFilterDecoder{bloom.Decoder},
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, r.Close()) }()
+	require.NotNil(t, r.tableFilter, "expected bloom filter to be loaded on the reader")
+
+	// Build a typed iterator so we can call bloomFilterMayContain directly.
+	// This bypasses the index-iter dst-space limitation noted in
+	// TestVirtualReaderBlockPrefixSubstitution and isolates the bloom probe
+	// behavior.
+	params := virtual.VirtualReaderParams{
+		Lower:   base.MakeInternalKey([]byte("!"), base.SeqNumMax, base.InternalKeyKindSet),
+		Upper:   base.MakeRangeDeleteSentinelKey([]byte("/tenant/5")),
+		FileNum: 1,
+	}
+
+	iter, err := newColumnBlockSingleLevelIterator(context.Background(), r, IterOptions{
+		Transforms: IterTransforms{
+			BlockPrefixSubstitution: blockiter.BlockPrefixSubstitution{Src: src, Dst: dst},
+		},
+		FilterBlockSizeLimit: AlwaysUseFilterBlock,
+		Env: ReadEnv{
+			Virtual: &params,
+		},
+		ReaderProvider: MakeTrivialReaderProvider(r),
+		BlobContext:    AssertNoBlobHandles,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, iter.Close()) }()
+
+	// Case 1: a dst-space prefix that maps (after inversion) to a key the
+	// physical SST contains. Without inversion this would be a false
+	// negative: the filter is built over src-space keys, so a raw probe
+	// with /tenant/4/key0001 would miss.
+	hitPrefix := []byte("/tenant/4/key0001")
+	mayContain, err := iter.bloomFilterMayContain(hitPrefix)
+	require.NoError(t, err)
+	require.True(t, mayContain,
+		"expected bloom hit for inverted prefix %q (storage-space %q) but got miss",
+		hitPrefix, append(append([]byte{}, src...), hitPrefix[len(dst):]...))
+
+	// Case 2: a dst-space prefix that doesn't exist in the table. With a
+	// 100-bit bloom filter, false positives are extremely unlikely.
+	missPrefix := []byte("/tenant/4/zzzz")
+	mayContain, err = iter.bloomFilterMayContain(missPrefix)
+	require.NoError(t, err)
+	require.False(t, mayContain,
+		"expected bloom miss for prefix %q with no matching key", missPrefix)
+
+	// Case 3: a probe key that doesn't even start with Dst. This must be a
+	// definite miss (analogous to the SyntheticPrefix CutPrefix failure
+	// path).
+	outOfRange := []byte("/tenant/9/foo")
+	mayContain, err = iter.bloomFilterMayContain(outOfRange)
+	require.NoError(t, err)
+	require.False(t, mayContain,
+		"expected definite miss for prefix %q outside destination space", outOfRange)
 }

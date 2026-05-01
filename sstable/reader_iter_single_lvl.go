@@ -1123,6 +1123,20 @@ func (i *singleLevelIterator[I, PI, D, PD]) bloomFilterMayContain(prefix []byte)
 			// This prefix will not be found inside this table.
 			return false, nil
 		}
+	} else if i.transforms.BlockPrefixSubstitution.IsSet() {
+		// The bloom filter was constructed at write time over storage-space
+		// (Src) keys; the externally-visible probe key is in destination-space
+		// (Dst). Invert: strip Dst, prepend Src. If the probe key doesn't
+		// start with Dst, it cannot match anything in this table.
+		sub := i.transforms.BlockPrefixSubstitution
+		rest, ok := bytes.CutPrefix(prefix, sub.Dst)
+		if !ok {
+			return false, nil
+		}
+		buf := make([]byte, 0, len(sub.Src)+len(rest))
+		buf = append(buf, sub.Src...)
+		buf = append(buf, rest...)
+		prefixToCheck = buf
 	}
 
 	dataH, err := i.reader.readFilterBlock(i.ctx, i.readEnv.Block, i.indexFilterRH, i.reader.filterBH)
