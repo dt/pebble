@@ -455,6 +455,110 @@ func TestVirtualClone_BlockPropertyFilterDisabled(t *testing.T) {
 	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2", "/tenant/4/k3"}, got)
 }
 
+// TestVirtualClone_MemtableOnly verifies that VirtualClone forces a flush of
+// any memtable whose contents overlap srcSpan, so that recent writes that
+// haven't yet flushed appear in the cloned destination.
+func TestVirtualClone_MemtableOnly(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Write keys but do NOT call Flush; the keys live only in the memtable.
+	srcKeys := []string{
+		"/tenant/1/k1",
+		"/tenant/1/k2",
+		"/tenant/1/k3",
+	}
+	setMany(t, d, srcKeys, value)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Cloned dst-space keys must be readable.
+	for _, k := range srcKeys {
+		dstKey := "/tenant/4/" + k[len(srcPrefix):]
+		require.Equal(t, value, mustGet(t, d, dstKey),
+			"expected dst key %s to be readable after VirtualClone forced a flush", dstKey)
+	}
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2", "/tenant/4/k3"}, got)
+}
+
+// TestVirtualClone_MixedMemtableAndLSM verifies that data spread across L6
+// (flushed+compacted) and the memtable both make it into the clone.
+func TestVirtualClone_MixedMemtableAndLSM(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Flush + compact some keys to L6.
+	lsmKeys := []string{"/tenant/1/A0", "/tenant/1/A1", "/tenant/1/A2"}
+	setMany(t, d, lsmKeys, value)
+	require.NoError(t, d.Flush())
+	require.NoError(t, d.Compact(context.Background(),
+		[]byte("/tenant/1/A0"), []byte("/tenant/1/A2\x00"), true))
+
+	// Write more keys to the memtable (no flush).
+	memKeys := []string{"/tenant/1/B0", "/tenant/1/B1", "/tenant/1/B2"}
+	setMany(t, d, memKeys, value)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	want := []string{
+		"/tenant/4/A0", "/tenant/4/A1", "/tenant/4/A2",
+		"/tenant/4/B0", "/tenant/4/B1", "/tenant/4/B2",
+	}
+	for _, k := range want {
+		require.Equal(t, value, mustGet(t, d, k),
+			"expected %s to appear in clone (LSM+memtable mix)", k)
+	}
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, want, got)
+}
+
+// TestVirtualClone_NoMemtableOverlap verifies that memtable writes outside
+// srcSpan do not appear in the destination, and that the LSM data still
+// clones correctly. The clone must remain correct whether or not an
+// unrelated flush is forced.
+func TestVirtualClone_NoMemtableOverlap(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Flush some in-span keys to L6 so there's LSM data to clone.
+	setMany(t, d, []string{"/tenant/1/k1", "/tenant/1/k2"}, value)
+	require.NoError(t, d.Flush())
+
+	// Write unrelated keys (well outside srcSpan) to the memtable.
+	setMany(t, d, []string{"/tenant/9/x", "/tenant/9/y"}, value)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Only the LSM-resident in-span data should appear in dst-space.
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2"}, got)
+
+	// And the unrelated memtable keys must still be readable in src space
+	// (whether they were forced to flush or not is an implementation detail).
+	for _, k := range []string{"/tenant/9/x", "/tenant/9/y"} {
+		require.Equal(t, value, mustGet(t, d, k))
+	}
+}
+
 // TestVirtualClone_ConcurrentCompactionRace_Sketch documents a desired
 // concurrency invariant for D2. A real test requires plumbing a hook that
 // fires between Snapshot and UpdateVersionLocked; that machinery isn't

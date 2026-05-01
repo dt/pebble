@@ -173,6 +173,16 @@ type clonePlanEntry struct {
 func (d *DB) virtualCloneAttempt(
 	ctx context.Context, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
 ) (retried bool, _ error) {
+	// Before snapshotting the version, check whether any memtable contains keys
+	// overlapping srcSpan. If so, force a flush and wait for it before
+	// proceeding; otherwise recent writes to keys in srcSpan that haven't yet
+	// flushed would be silently absent from the cloned destination. This
+	// mirrors the pattern used by DB.Compact (db.go:1810-1859) and the
+	// memtable-overlap handling in DB.ingest (ingest.go:1863-1962).
+	if retried, err := d.flushMemtablesOverlappingClone(ctx, srcSpan); err != nil || retried {
+		return retried, err
+	}
+
 	d.mu.Lock()
 	currentVersion := d.mu.versions.currentVersion()
 	currentVersion.Ref()
@@ -344,6 +354,69 @@ func (d *DB) virtualCloneAttempt(
 	}
 	d.updateReadStateLocked(d.opts.DebugCheck)
 	return false, nil
+}
+
+// flushMemtablesOverlappingClone walks d.mu.mem.queue and forces a flush of
+// the newest memtable whose contents overlap srcSpan, waiting for the flush
+// to complete before returning. The returned retried bool is true when a
+// flush was forced (signalling the caller to start a fresh attempt with a
+// fresh version snapshot).
+//
+// This mirrors the memtable-overlap pattern in DB.Compact (db.go:1810-1859):
+// walk the queue from newest to oldest, find the newest overlapping
+// memtable, force a rotation if it's the mutable one, schedule a flush, and
+// then wait on the flushed channel.
+func (d *DB) flushMemtablesOverlappingClone(
+	ctx context.Context, srcSpan KeyRange,
+) (retried bool, _ error) {
+	d.mu.Lock()
+	mem, err := func() (*flushableEntry, error) {
+		// Walk from newest (mutable) to oldest. We only need to wait on the
+		// newest overlapping memtable; once it (and any older ones already
+		// scheduled to flush) finishes, all of those keys are in L0.
+		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
+			mem := d.mu.mem.queue[i]
+			var anyOverlaps bool
+			mem.computePossibleOverlaps(func(b bounded) shouldContinue {
+				anyOverlaps = true
+				return stopIteration
+			}, srcSpan)
+			if !anyOverlaps {
+				continue
+			}
+			var err error
+			if mem.flushable == d.mu.mem.mutable {
+				// We must hold both commitPipeline.mu and DB.mu when calling
+				// makeRoomForWrite. Lock order forces us to release DB.mu so
+				// we can grab commit.mu first.
+				d.mu.Unlock()
+				d.commit.mu.Lock()
+				d.mu.Lock()
+				defer d.commit.mu.Unlock() //nolint:deferloop
+				if mem.flushable == d.mu.mem.mutable {
+					err = d.makeRoomForWrite(nil)
+				}
+			}
+			mem.flushForced = true
+			d.maybeScheduleFlush()
+			return mem, err
+		}
+		return nil, nil
+	}()
+	d.mu.Unlock()
+
+	if err != nil {
+		return false, err
+	}
+	if mem == nil {
+		return false, nil
+	}
+	select {
+	case <-mem.flushed:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	return true, nil
 }
 
 // buildFullyContainedVirtual produces a virtual TableMetadata for a source
