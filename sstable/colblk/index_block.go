@@ -5,6 +5,7 @@
 package colblk
 
 import (
+	"bytes"
 	"slices"
 	"unsafe"
 
@@ -192,12 +193,21 @@ type IndexIter struct {
 	row     int
 
 	syntheticPrefixAndSuffix blockiter.SyntheticPrefixAndSuffix
+	// blockPrefixSubstitution, if set, replaces a leading source prefix with a
+	// destination prefix when emitting separators, and is inverted on incoming
+	// seek keys. Mutually exclusive with a synthetic prefix.
+	blockPrefixSubstitution blockiter.BlockPrefixSubstitution
 
 	h block.BufferHandle
 	// TODO(radu): remove allocDecoder and require any Init callers to provide the
 	// decoder.
 	allocDecoder IndexBlockDecoder
 	keyBuf       []byte
+	// seekKeyBuf is a scratch buffer used to translate seek keys from
+	// destination-prefix space to storage-prefix space when a
+	// BlockPrefixSubstitution is in effect. It is reused across Seek calls;
+	// its contents are only valid for the duration of the underlying search.
+	seekKeyBuf []byte
 }
 
 var _ blockiter.Index = (*IndexIter)(nil)
@@ -212,7 +222,8 @@ func (i *IndexIter) InitWithDecoder(
 	i.n = int(d.bd.header.Rows)
 	i.row = -1
 	i.syntheticPrefixAndSuffix = transforms.SyntheticPrefixAndSuffix
-	// Leave h, allocDecoder, keyBuf unchanged.
+	i.blockPrefixSubstitution = transforms.BlockPrefixSubstitution
+	// Leave h, allocDecoder, keyBuf, seekKeyBuf unchanged.
 }
 
 // Init initializes an iterator from the provided block data slice.
@@ -272,7 +283,7 @@ func (i *IndexIter) Handle() block.BufferHandle {
 // iterator must be positioned at a valid row.
 func (i *IndexIter) Separator() []byte {
 	key := i.d.separators.At(i.row)
-	if i.syntheticPrefixAndSuffix.IsUnset() {
+	if i.syntheticPrefixAndSuffix.IsUnset() && !i.blockPrefixSubstitution.IsSet() {
 		return key
 	}
 	return i.applyTransforms(key)
@@ -297,8 +308,18 @@ func (i *IndexIter) applyTransforms(key []byte) []byte {
 	if syntheticSuffix.IsSet() {
 		key = key[:i.split(key)]
 	}
-	i.keyBuf = slices.Grow(i.keyBuf[:0], len(syntheticPrefix)+len(key)+len(syntheticSuffix))
-	i.keyBuf = append(i.keyBuf, syntheticPrefix...)
+	// BlockPrefixSubstitution and SyntheticPrefix are mutually exclusive. If a
+	// substitution is set, strip its Src from the stored separator and treat
+	// Dst as the implicit prefix to prepend.
+	var prefix []byte
+	if sub := i.blockPrefixSubstitution; sub.IsSet() {
+		key = key[len(sub.Src):]
+		prefix = sub.Dst
+	} else {
+		prefix = syntheticPrefix
+	}
+	i.keyBuf = slices.Grow(i.keyBuf[:0], len(prefix)+len(key)+len(syntheticSuffix))
+	i.keyBuf = append(i.keyBuf, prefix...)
 	i.keyBuf = append(i.keyBuf, key...)
 	i.keyBuf = append(i.keyBuf, syntheticSuffix...)
 	return i.keyBuf
@@ -323,6 +344,36 @@ func (i *IndexIter) BlockHandleWithProperties() (block.HandleWithProperties, err
 // greater or equal to the given key. It returns false if the seek key is
 // greater than all index block separators.
 func (i *IndexIter) SeekGE(key []byte) bool {
+	// If a BlockPrefixSubstitution is in effect, the incoming seek key is in
+	// destination-prefix space while the stored separators are in
+	// storage-prefix space. Invert the seek key (strip Dst, prepend Src) so we
+	// can compare directly against stored separators in the hot loop. If the
+	// incoming key's leading bytes don't match Dst, route to the appropriate
+	// extreme: a key that sorts before all dst-space keys lands at row 0; a
+	// key that sorts after all dst-space keys lands past the end.
+	if sub := i.blockPrefixSubstitution; sub.IsSet() {
+		dstLen := len(sub.Dst)
+		var keyPrefix []byte
+		if len(key) <= dstLen {
+			keyPrefix = key
+			key = nil
+		} else {
+			keyPrefix = key[:dstLen]
+			key = key[dstLen:]
+		}
+		if cmp := bytes.Compare(keyPrefix, sub.Dst); cmp != 0 {
+			if cmp < 0 {
+				i.row = 0
+				return i.n > 0
+			}
+			i.row = i.n
+			return false
+		}
+		// Translate to storage-prefix space by prepending Src.
+		i.seekKeyBuf = append(i.seekKeyBuf[:0], sub.Src...)
+		i.seekKeyBuf = append(i.seekKeyBuf, key...)
+		key = i.seekKeyBuf
+	}
 	// Define f(-1) == false and f(upper) == true.
 	// Invariant: f(index-1) == false, f(upper) == true.
 	index, upper := 0, i.n
@@ -333,7 +384,25 @@ func (i *IndexIter) SeekGE(key []byte) bool {
 		// TODO(jackson): Is Bytes.At or Bytes.Slice(Bytes.Offset(h),
 		// Bytes.Offset(h+1)) faster in this code?
 		separator := i.d.separators.At(h)
-		if !i.syntheticPrefixAndSuffix.IsUnset() {
+		if i.syntheticPrefixAndSuffix.HasSuffix() {
+			// We've inverted the seek key into storage-prefix space (if
+			// applicable), so we only need to materialize the synthetic
+			// suffix (which lives in suffix-space, independent of any
+			// prefix substitution). The synthetic prefix path retains its
+			// previous behavior since substitution and synthetic prefix are
+			// mutually exclusive.
+			// TODO(radu): compare without materializing the transformed key.
+			syntheticPrefix := i.syntheticPrefixAndSuffix.Prefix()
+			syntheticSuffix := i.syntheticPrefixAndSuffix.Suffix()
+			sepKey := separator[:i.split(separator)]
+			i.keyBuf = slices.Grow(i.keyBuf[:0], len(syntheticPrefix)+len(sepKey)+len(syntheticSuffix))
+			i.keyBuf = append(i.keyBuf, syntheticPrefix...)
+			i.keyBuf = append(i.keyBuf, sepKey...)
+			i.keyBuf = append(i.keyBuf, syntheticSuffix...)
+			separator = i.keyBuf
+		} else if i.syntheticPrefixAndSuffix.HasPrefix() {
+			// Pure synthetic prefix (no suffix and, by mutual exclusion, no
+			// BlockPrefixSubstitution). Materialize the prefixed separator.
 			// TODO(radu): compare without materializing the transformed key.
 			separator = i.applyTransforms(separator)
 		}
@@ -388,6 +457,7 @@ func (i *IndexIter) Close() error {
 	i.d = nil
 	i.n = 0
 	i.syntheticPrefixAndSuffix = blockiter.SyntheticPrefixAndSuffix{}
+	i.blockPrefixSubstitution = blockiter.BlockPrefixSubstitution{}
 	return nil
 }
 

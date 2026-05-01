@@ -135,15 +135,82 @@ func TestVirtualReaderBlockPrefixSubstitution(t *testing.T) {
 	// BlockPrefixSubstitution to its separators. Skip until that lands.
 
 	t.Run("seek-ge-in-dst-space", func(t *testing.T) {
-		t.Skip("TODO(next-slice): requires colblk.IndexIter to apply " +
-			"BlockPrefixSubstitution to separators; see " +
-			"sstable/colblk/index_block.go IndexIter.Separator/SeekGE.")
-		_ = keysDst // avoid 'declared and not used' if Skip is removed
+		// SeekGE with a dst-space key: drives index-level seek which now
+		// inverts the seek key into storage-prefix space before consulting
+		// stored separators.
+		params := virtual.VirtualReaderParams{
+			Lower:   base.MakeInternalKey([]byte("!"), base.SeqNumMax, base.InternalKeyKindSet),
+			Upper:   base.MakeRangeDeleteSentinelKey([]byte("/tenant/5")),
+			FileNum: 1,
+		}
+
+		iter, err := r.NewPointIter(context.Background(), IterOptions{
+			Transforms: IterTransforms{
+				BlockPrefixSubstitution: blockiter.BlockPrefixSubstitution{Src: src, Dst: dst},
+			},
+			FilterBlockSizeLimit: NeverUseFilterBlock,
+			Env: ReadEnv{
+				Virtual: &params,
+			},
+			ReaderProvider: MakeTrivialReaderProvider(r),
+			BlobContext:    AssertNoBlobHandles,
+		})
+		require.NoError(t, err)
+		defer func() { require.NoError(t, iter.Close()) }()
+
+		// Seek to a dst-space key in the middle of the range and walk
+		// forward; expect to land on keysDst[5] and emit the rest.
+		seekKey := keysDst[5]
+		var got [][]byte
+		for kv := iter.SeekGE(seekKey, base.SeekGEFlagsNone); kv != nil; kv = iter.Next() {
+			got = append(got, append([]byte(nil), kv.K.UserKey...))
+		}
+		require.Equal(t, len(keysDst)-5, len(got),
+			"expected %d keys; got %d", len(keysDst)-5, len(got))
+		for i := range got {
+			require.Equal(t, string(keysDst[5+i]), string(got[i]),
+				"key mismatch at i=%d", i)
+		}
 	})
 
 	t.Run("subset-bounds", func(t *testing.T) {
-		t.Skip("TODO(next-slice): requires colblk.IndexIter to apply " +
-			"BlockPrefixSubstitution to separators; see " +
-			"sstable/colblk/index_block.go IndexIter.Separator/SeekGE.")
+		// Virtual SST clipped to a strict subset of dst-space keys. Both the
+		// lower and upper bounds are dst-space keys; the index-level seek
+		// must compare them against substitution-aware separators.
+		lower := keysDst[3]
+		upper := keysDst[12]
+		params := virtual.VirtualReaderParams{
+			Lower:   base.MakeInternalKey(lower, base.SeqNumMax, base.InternalKeyKindSet),
+			Upper:   base.MakeRangeDeleteSentinelKey(upper),
+			FileNum: 1,
+		}
+
+		iter, err := r.NewPointIter(context.Background(), IterOptions{
+			Transforms: IterTransforms{
+				BlockPrefixSubstitution: blockiter.BlockPrefixSubstitution{Src: src, Dst: dst},
+			},
+			FilterBlockSizeLimit: NeverUseFilterBlock,
+			Env: ReadEnv{
+				Virtual: &params,
+			},
+			ReaderProvider: MakeTrivialReaderProvider(r),
+			BlobContext:    AssertNoBlobHandles,
+		})
+		require.NoError(t, err)
+		defer func() { require.NoError(t, iter.Close()) }()
+
+		var got [][]byte
+		for kv := iter.First(); kv != nil; kv = iter.Next() {
+			got = append(got, append([]byte(nil), kv.K.UserKey...))
+		}
+		// Expect dst-space keys in [keysDst[3], keysDst[12]) given the
+		// exclusive-upper sentinel.
+		want := keysDst[3:12]
+		require.Equal(t, len(want), len(got),
+			"expected %d keys; got %d", len(want), len(got))
+		for i := range want {
+			require.Equal(t, string(want[i]), string(got[i]),
+				"key mismatch at i=%d", i)
+		}
 	})
 }
