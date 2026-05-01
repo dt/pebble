@@ -92,6 +92,13 @@ const (
 	customTagBlobReferences    = 69
 	// customTagBlobReferences2 contains BackingValueSize for each BlobReference.
 	customTagBlobReferences2 = 70
+	// customTagBlockPrefixSubstitution carries a TableMetadata's
+	// BlockPrefixSubstitution. The bytes value is a varint length-prefixed Src
+	// followed by a varint length-prefixed Dst. This tag is in the
+	// non-safe-ignore range: a table that requires the substitution will
+	// silently emit incorrect (untranslated) keys if the reader does not apply
+	// it, so older binaries fatal on replay rather than risk that.
+	customTagBlockPrefixSubstitution = 71
 )
 
 // DeletedTableEntry holds the state for a sstable deletion from a level. The
@@ -423,6 +430,7 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 			var noRangeKeySets bool
 			var syntheticPrefix sstable.SyntheticPrefix
 			var syntheticSuffix sstable.SyntheticSuffix
+			var blockPrefixSubstitution sstable.BlockPrefixSubstitution
 			var blobReferences BlobReferences
 			var blobReferenceDepth BlobReferenceDepth
 			if tag == tagNewFile4 || tag == tagNewFile5 {
@@ -493,6 +501,24 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 							return err
 						}
 
+					case customTagBlockPrefixSubstitution:
+						src, err := d.readBytes()
+						if err != nil {
+							return err
+						}
+						dst, err := d.readBytes()
+						if err != nil {
+							return err
+						}
+						if len(src) == 0 {
+							return base.CorruptionErrorf(
+								"new-file4: block prefix substitution with empty Src")
+						}
+						blockPrefixSubstitution = sstable.BlockPrefixSubstitution{
+							Src: src,
+							Dst: dst,
+						}
+
 					case customTagBlobReferences, customTagBlobReferences2:
 						// The first varint encodes the 'blob reference depth'
 						// of the table.
@@ -540,6 +566,14 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 					}
 				}
 			}
+			if blockPrefixSubstitution.IsSet() && !virtualState.virtual {
+				return base.CorruptionErrorf(
+					"new-file4: block prefix substitution on non-virtual file")
+			}
+			if blockPrefixSubstitution.IsSet() && len(syntheticPrefix) > 0 {
+				return base.CorruptionErrorf(
+					"new-file4: block prefix substitution and synthetic prefix both set")
+			}
 			m := &TableMetadata{
 				TableNum:                 fileNum,
 				Size:                     size,
@@ -550,6 +584,7 @@ func (v *VersionEdit) Decode(r io.Reader) error {
 				BlobReferenceDepth:       blobReferenceDepth,
 				Virtual:                  virtualState.virtual,
 				SyntheticPrefixAndSuffix: sstable.MakeSyntheticPrefixAndSuffix(syntheticPrefix, syntheticSuffix),
+				BlockPrefixSubstitution:  blockPrefixSubstitution,
 			}
 
 			if tag != tagNewFile5 { // no range keys present
@@ -918,7 +953,7 @@ func (v *VersionEdit) Encode(w io.Writer) error {
 		e.writeUvarint(uint64(x.FileNum))
 	}
 	for _, x := range v.NewTables {
-		customFields := x.Meta.CreationTime != 0 || x.Meta.Virtual || len(x.Meta.BlobReferences) > 0 || x.Meta.RangeKeyKinds == OnlyRangeKeyUnsetAndDelete
+		customFields := x.Meta.CreationTime != 0 || x.Meta.Virtual || len(x.Meta.BlobReferences) > 0 || x.Meta.RangeKeyKinds == OnlyRangeKeyUnsetAndDelete || x.Meta.BlockPrefixSubstitution.IsSet()
 		var tag uint64
 		switch {
 		case x.Meta.HasRangeKeys:
@@ -984,6 +1019,11 @@ func (v *VersionEdit) Encode(w io.Writer) error {
 			if x.Meta.SyntheticPrefixAndSuffix.HasSuffix() {
 				e.writeUvarint(customTagSyntheticSuffix)
 				e.writeBytes(x.Meta.SyntheticPrefixAndSuffix.Suffix())
+			}
+			if x.Meta.BlockPrefixSubstitution.IsSet() {
+				e.writeUvarint(customTagBlockPrefixSubstitution)
+				e.writeBytes(x.Meta.BlockPrefixSubstitution.Src)
+				e.writeBytes(x.Meta.BlockPrefixSubstitution.Dst)
 			}
 			if len(x.Meta.BlobReferences) > 0 {
 				writeBackingValueSize := false

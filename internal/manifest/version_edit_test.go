@@ -196,6 +196,168 @@ func TestVERoundTripBackingValueSizeEqualValueSize(t *testing.T) {
 	}
 }
 
+// TestVERoundTripBlockPrefixSubstitution verifies that BlockPrefixSubstitution
+// is preserved through encode/decode for a virtual table, both standalone and
+// alongside a synthetic suffix.
+func TestVERoundTripBlockPrefixSubstitution(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
+	mPhys := (&TableMetadata{
+		TableNum:              900,
+		Size:                  4096,
+		CreationTime:          1000,
+		SeqNums:               base.SeqNumRange{Low: 1, High: 2},
+		LargestSeqNumAbsolute: 2,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("src/a"), 0, base.InternalKeyKindSet),
+		base.MakeInternalKey([]byte("src/z"), 0, base.InternalKeyKindSet),
+	)
+	mPhys.InitPhysicalBacking()
+
+	mkVirt := func(num base.TableNum, sub sstable.BlockPrefixSubstitution, suf sstable.SyntheticSuffix) *TableMetadata {
+		m := (&TableMetadata{
+			TableNum:                 num,
+			Size:                     2048,
+			CreationTime:             1001,
+			SeqNums:                  base.SeqNumRange{Low: 1, High: 2},
+			LargestSeqNumAbsolute:    2,
+			Virtual:                  true,
+			BlockPrefixSubstitution:  sub,
+			SyntheticPrefixAndSuffix: sstable.MakeSyntheticPrefixAndSuffix(nil, suf),
+		}).ExtendPointKeyBounds(
+			cmp,
+			base.MakeInternalKey([]byte("dst/a"), 0, base.InternalKeyKindSet),
+			base.MakeInternalKey([]byte("dst/z"), 0, base.InternalKeyKindSet),
+		)
+		m.AttachVirtualBacking(mPhys.TableBacking)
+		return m
+	}
+
+	subOnly := sstable.BlockPrefixSubstitution{Src: []byte("src/"), Dst: []byte("dst/")}
+	mSub := mkVirt(901, subOnly, nil)
+	mSubAndSuffix := mkVirt(902, subOnly, []byte("zz"))
+
+	ve1 := VersionEdit{
+		CreatedBackingTables: []*TableBacking{mPhys.TableBacking},
+		NewTables: []NewTableEntry{
+			{Level: 5, Meta: mSub, BackingFileNum: mPhys.TableBacking.DiskFileNum},
+			{Level: 5, Meta: mSubAndSuffix, BackingFileNum: mPhys.TableBacking.DiskFileNum},
+		},
+	}
+	buf := new(bytes.Buffer)
+	require.NoError(t, ve1.Encode(buf))
+	var ve2 VersionEdit
+	require.NoError(t, ve2.Decode(buf))
+	var bve BulkVersionEdit
+	require.NoError(t, bve.Accumulate(&ve2))
+
+	require.Equal(t, len(ve1.NewTables), len(ve2.NewTables))
+	for i, nt := range ve2.NewTables {
+		want := ve1.NewTables[i].Meta.BlockPrefixSubstitution
+		got := nt.Meta.BlockPrefixSubstitution
+		require.Equal(t, want.Src, got.Src, "Src for table %s", nt.Meta.TableNum)
+		require.Equal(t, want.Dst, got.Dst, "Dst for table %s", nt.Meta.TableNum)
+		// Suffix preserved across round-trip.
+		require.Equal(t,
+			ve1.NewTables[i].Meta.SyntheticPrefixAndSuffix.Suffix(),
+			nt.Meta.SyntheticPrefixAndSuffix.Suffix())
+		// IterTransforms propagates the substitution.
+		require.Equal(t, want, nt.Meta.IterTransforms().BlockPrefixSubstitution)
+	}
+}
+
+// TestVEDecodeBlockPrefixSubstitutionRejection verifies that decoding rejects
+// invalid encodings of BlockPrefixSubstitution.
+func TestVEDecodeBlockPrefixSubstitutionRejection(t *testing.T) {
+	cmp := base.DefaultComparer.Compare
+
+	// Helper: encode a version edit, then check that decoding fails.
+	encodeAndExpectDecodeError := func(t *testing.T, ve VersionEdit, wantSubstr string) {
+		t.Helper()
+		buf := new(bytes.Buffer)
+		require.NoError(t, ve.Encode(buf))
+		var out VersionEdit
+		err := out.Decode(buf)
+		require.Error(t, err)
+		require.Contains(t, err.Error(), wantSubstr)
+	}
+
+	// Case 1: substitution set on a non-virtual (physical) table. We construct
+	// the metadata directly (bypassing the virtual-only invariant) and verify
+	// that decode rejects it.
+	mPhys := (&TableMetadata{
+		TableNum:                900,
+		Size:                    4096,
+		CreationTime:            1000,
+		SeqNums:                 base.SeqNumRange{Low: 1, High: 2},
+		LargestSeqNumAbsolute:   2,
+		BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{Src: []byte("src/"), Dst: []byte("dst/")},
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("src/a"), 0, base.InternalKeyKindSet),
+		base.MakeInternalKey([]byte("src/z"), 0, base.InternalKeyKindSet),
+	)
+	mPhys.InitPhysicalBacking()
+	encodeAndExpectDecodeError(t, VersionEdit{
+		NewTables: []NewTableEntry{{Level: 5, Meta: mPhys}},
+	}, "non-virtual")
+
+	// Case 2: substitution with empty Src. We can't construct this through the
+	// public encoder (IsSet would be false), so we hand-craft the bytes by
+	// emitting the customTagBlockPrefixSubstitution tag with empty Src.
+	mPhys2 := (&TableMetadata{
+		TableNum:              901,
+		Size:                  4096,
+		CreationTime:          1000,
+		SeqNums:               base.SeqNumRange{Low: 1, High: 2},
+		LargestSeqNumAbsolute: 2,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("src/a"), 0, base.InternalKeyKindSet),
+		base.MakeInternalKey([]byte("src/z"), 0, base.InternalKeyKindSet),
+	)
+	mPhys2.InitPhysicalBacking()
+	mVirt := (&TableMetadata{
+		TableNum:              902,
+		Size:                  2048,
+		CreationTime:          1001,
+		SeqNums:               base.SeqNumRange{Low: 1, High: 2},
+		LargestSeqNumAbsolute: 2,
+		Virtual:               true,
+	}).ExtendPointKeyBounds(
+		cmp,
+		base.MakeInternalKey([]byte("dst/a"), 0, base.InternalKeyKindSet),
+		base.MakeInternalKey([]byte("dst/z"), 0, base.InternalKeyKindSet),
+	)
+	mVirt.AttachVirtualBacking(mPhys2.TableBacking)
+	ve := VersionEdit{
+		CreatedBackingTables: []*TableBacking{mPhys2.TableBacking},
+		NewTables: []NewTableEntry{{
+			Level:          5,
+			Meta:           mVirt,
+			BackingFileNum: mPhys2.TableBacking.DiskFileNum,
+		}},
+	}
+	encoded := new(bytes.Buffer)
+	require.NoError(t, ve.Encode(encoded))
+	// Splice in a customTagBlockPrefixSubstitution with empty Src and Dst just
+	// before customTagTerminate (the last byte). This depends on the encoder
+	// not appending anything after the terminator, which is currently true.
+	raw := encoded.Bytes()
+	require.Equal(t, byte(customTagTerminate), raw[len(raw)-1])
+	injected := append([]byte{}, raw[:len(raw)-1]...)
+	injected = append(injected,
+		customTagBlockPrefixSubstitution, // tag
+		0,                                // length-prefix for Src (empty)
+		0,                                // length-prefix for Dst (empty)
+		customTagTerminate,
+	)
+	var out VersionEdit
+	err := out.Decode(bytes.NewReader(injected))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "empty Src")
+}
+
 func TestVersionEditRoundTrip(t *testing.T) {
 	cmp := base.DefaultComparer.Compare
 	m1 := (&TableMetadata{

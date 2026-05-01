@@ -202,6 +202,19 @@ type TableMetadata struct {
 	// SyntheticPrefix is used to prepend a prefix to all keys and/or override all
 	// suffixes in a table; used for some virtual tables.
 	SyntheticPrefixAndSuffix sstable.SyntheticPrefixAndSuffix
+
+	// BlockPrefixSubstitution, if set, replaces the leading bytes of every key
+	// emitted by the table's iterator. Unlike SyntheticPrefixAndSuffix's prefix
+	// component, which is *prepended* to keys whose backing SST stores them with
+	// the prefix already stripped, BlockPrefixSubstitution operates on SSTs
+	// whose physically stored keys retain Src as the leading bytes of every
+	// key; the iterator strips len(Src) and prepends Dst during key
+	// materialization.
+	//
+	// Only valid for virtual sstables. It is mutually exclusive with the prefix
+	// component of SyntheticPrefixAndSuffix; the suffix component may still be
+	// set alongside a substitution.
+	BlockPrefixSubstitution sstable.BlockPrefixSubstitution
 }
 
 // RangeKeyKinds describes which kinds of range keys may be present in a table.
@@ -300,9 +313,21 @@ func (m *TableMetadata) SyntheticSeqNum() sstable.SyntheticSeqNum {
 // IterTransforms returns an sstable.IterTransforms populated according to the
 // file.
 func (m *TableMetadata) IterTransforms() sstable.IterTransforms {
+	if invariants.Enabled && m.BlockPrefixSubstitution.IsSet() {
+		if !m.Virtual {
+			panic(errors.AssertionFailedf(
+				"pebble: BlockPrefixSubstitution set on non-virtual table %s", m.TableNum))
+		}
+		if m.SyntheticPrefixAndSuffix.HasPrefix() {
+			panic(errors.AssertionFailedf(
+				"pebble: BlockPrefixSubstitution and SyntheticPrefix both set on table %s",
+				m.TableNum))
+		}
+	}
 	return sstable.IterTransforms{
 		SyntheticSeqNum:          m.SyntheticSeqNum(),
 		SyntheticPrefixAndSuffix: m.SyntheticPrefixAndSuffix,
+		BlockPrefixSubstitution:  m.BlockPrefixSubstitution,
 	}
 }
 
@@ -1160,6 +1185,18 @@ func (m *TableMetadata) Validate(cmp Compare, formatKey base.FormatKey) error {
 	if m.SyntheticPrefixAndSuffix.HasSuffix() {
 		if !m.Virtual {
 			return base.CorruptionErrorf("non-virtual file with synthetic suffix")
+		}
+	}
+	if m.BlockPrefixSubstitution.IsSet() {
+		if !m.Virtual {
+			return base.CorruptionErrorf("non-virtual file with block prefix substitution")
+		}
+		if len(m.BlockPrefixSubstitution.Src) == 0 {
+			return base.CorruptionErrorf("block prefix substitution with empty Src")
+		}
+		if m.SyntheticPrefixAndSuffix.HasPrefix() {
+			return base.CorruptionErrorf(
+				"block prefix substitution and synthetic prefix are mutually exclusive")
 		}
 	}
 
