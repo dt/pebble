@@ -267,6 +267,16 @@ const (
 	// such marked tables to have been compacted.
 	FormatRowblkMarkedForCompaction
 
+	// FormatPrefixSubstitution is a format major version that adds support for
+	// virtual sstables that carry a BlockPrefixSubstitution transform. The
+	// substitution rewrites the leading bytes of every key emitted by the
+	// table's iterator. Persisting the transform requires the new manifest
+	// custom tag (customTagBlockPrefixSubstitution), which sits in the non-safe-
+	// ignore range; older Pebble binaries fatal during manifest replay.
+	//
+	// VirtualClone requires this format major version.
+	FormatPrefixSubstitution
+
 	// -- Add new versions here --
 
 	// FormatNewest is the most recent format major version.
@@ -420,6 +430,9 @@ var formatMajorVersionMigrations = map[FormatMajorVersion]func(*DB) error{
 			return err
 		}
 		return d.finalizeFormatVersUpgrade(FormatRowblkMarkedForCompaction)
+	},
+	FormatPrefixSubstitution: func(d *DB) error {
+		return d.finalizeFormatVersUpgrade(FormatPrefixSubstitution)
 	},
 }
 

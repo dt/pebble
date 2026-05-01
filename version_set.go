@@ -491,6 +491,14 @@ func (vs *versionSet) UpdateVersionLocked(
 		if vs.getFormatMajorVersion() < FormatVirtualSSTables && len(ve.CreatedBackingTables) > 0 {
 			return base.AssertionFailedf("MANIFEST cannot contain virtual sstable records due to format major version")
 		}
+		if vs.getFormatMajorVersion() < FormatPrefixSubstitution {
+			for i := range ve.NewTables {
+				if ve.NewTables[i].Meta.BlockPrefixSubstitution.IsSet() {
+					return base.AssertionFailedf(
+						"MANIFEST cannot contain BlockPrefixSubstitution records due to format major version")
+				}
+			}
+		}
 
 		// Rotate the manifest if necessary. Rotating the manifest involves
 		// creating a new file and writing an initial version edit containing a
