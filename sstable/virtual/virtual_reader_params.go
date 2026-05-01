@@ -12,6 +12,17 @@ type VirtualReaderParams struct {
 // Constrain bounds will narrow the start, end bounds if they do not fit within
 // the virtual sstable. The function will return if the new end key is
 // inclusive.
+//
+// Note on BlockPrefixSubstitution: when the virtual sstable has a
+// BlockPrefixSubstitution configured, the externally-visible bounds (v.Lower,
+// v.Upper) and the start/end inputs are all in destination-prefix space. The
+// returned bounds remain in destination-prefix space; no inversion to source
+// space is performed here. The data-block iterator is responsible for
+// inverting destination-space seek keys to source space before consulting the
+// underlying block (see colblk.DataBlockIter.seekGEInternal). Iterator-emitted
+// keys are produced via BlockPrefixSubstitution.Apply, so per-key bounds
+// comparisons against the returned upper/lower in singleLevelIterator are
+// also in destination space and consistent.
 func (v *VirtualReaderParams) ConstrainBounds(
 	start, end []byte, endInclusive bool, compare func([]byte, []byte) int,
 ) (lastKeyInclusive bool, first []byte, last []byte) {
