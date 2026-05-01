@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/sstable/block/blockkind"
+	"github.com/cockroachdb/pebble/sstable/blockiter"
 	"github.com/cockroachdb/pebble/sstable/colblk"
 	"github.com/cockroachdb/pebble/sstable/rowblk"
 	"github.com/cockroachdb/pebble/sstable/valblk"
@@ -1111,6 +1112,190 @@ func (r *Reader) TableFormat() (TableFormat, error) {
 // blocks from the sstable.
 func (r *Reader) BlockReader() *block.Reader {
 	return &r.blockReader
+}
+
+// IndexBlockHandle returns the handle for the (top-level) index block. Used by
+// VirtualClone to determine whether the table uses a two-level index.
+func (r *Reader) IndexBlockHandle() block.Handle {
+	return r.indexBH
+}
+
+// DataBlockEntry describes a single data block reachable through the table's
+// index. It is yielded by WalkDataBlocks.
+type DataBlockEntry struct {
+	// Separator is a user key that is >= every key in this data block and <=
+	// every key in the next block. Materialized into a buffer owned by the
+	// walker; the slice is only valid until the next call to the yield function.
+	Separator []byte
+	// Handle is the data block handle (possibly with block properties).
+	Handle block.HandleWithProperties
+}
+
+// WalkDataBlocks walks every data block in the table in key order, invoking
+// fn with the (separator, handle) pair for each block. The traversal handles
+// both single-level and two-level index layouts. The Separator slice is owned
+// by the walker and only valid for the duration of the call to fn.
+//
+// If fn returns an error, walking is aborted and the error is returned.
+func (r *Reader) WalkDataBlocks(ctx context.Context, fn func(DataBlockEntry) error) error {
+	indexH, err := r.readTopLevelIndexBlock(ctx, block.NoReadEnv, noReadHandle)
+	if err != nil {
+		return err
+	}
+	defer indexH.Release()
+
+	top := r.tableFormat.newIndexIter()
+	if err := top.Init(r.Comparer, indexH.BlockData(), NoTransforms); err != nil {
+		return err
+	}
+	defer func() { _ = top.Close() }()
+
+	if !r.Attributes.Has(AttributeTwoLevelIndex) {
+		for valid := top.First(); valid; valid = top.Next() {
+			bh, err := top.BlockHandleWithProperties()
+			if err != nil {
+				return errCorruptIndexEntry(err)
+			}
+			if err := fn(DataBlockEntry{Separator: top.Separator(), Handle: bh}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	sub := r.tableFormat.newIndexIter()
+	defer func() { _ = sub.Close() }()
+	for valid := top.First(); valid; valid = top.Next() {
+		topBH, err := top.BlockHandleWithProperties()
+		if err != nil {
+			return errCorruptIndexEntry(err)
+		}
+		err = func() error {
+			subBlk, err := r.readIndexBlock(ctx, block.NoReadEnv, noReadHandle, topBH.Handle)
+			if err != nil {
+				return err
+			}
+			defer subBlk.Release()
+			if err := sub.Init(r.Comparer, subBlk.BlockData(), NoTransforms); err != nil {
+				return err
+			}
+			for valid := sub.First(); valid; valid = sub.Next() {
+				bh, err := sub.BlockHandleWithProperties()
+				if err != nil {
+					return errCorruptIndexEntry(err)
+				}
+				if err := fn(DataBlockEntry{Separator: sub.Separator(), Handle: bh}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ReadDataBlock reads the data block with the provided handle through the
+// reader's block cache. The returned BufferHandle must be released by the
+// caller.
+func (r *Reader) ReadDataBlock(
+	ctx context.Context, env block.ReadEnv, bh block.Handle,
+) (block.BufferHandle, error) {
+	return r.readDataBlock(ctx, env, noReadHandle, bh)
+}
+
+// IterateDataBlock reads the data block at bh and invokes fn once per KV in
+// the block, in sorted order. Keys and values are in storage-prefix space
+// (no transforms applied). The user-key slice is reused across calls; the
+// caller must copy it if retention beyond the call is required.
+//
+// IterateDataBlock is intended for use by VirtualClone-style block-level
+// rewrites and validations. It is only supported on colblk-format tables.
+func (r *Reader) IterateDataBlock(
+	ctx context.Context, bh block.Handle, fn func(key base.InternalKey, value []byte) error,
+) error {
+	if !r.tableFormat.BlockColumnar() {
+		return errors.New("pebble: IterateDataBlock requires colblk-format table")
+	}
+	bufH, err := r.readDataBlock(ctx, block.NoReadEnv, noReadHandle, bh)
+	if err != nil {
+		return err
+	}
+	defer bufH.Release()
+
+	var dec colblk.DataBlockDecoder
+	bd := dec.Init(r.keySchema, bufH.BlockData())
+	var iter colblk.DataBlockIter
+	iter.InitOnce(r.keySchema, r.Comparer, nil /* lazyValuer */, colblk.OptionalColumnConfig{})
+	if err := iter.Init(&dec, bd, blockiter.NoTransforms, colblk.OptionalColumnConfig{}); err != nil {
+		return err
+	}
+	defer func() { _ = iter.Close() }()
+	for kv := iter.First(); kv != nil; kv = iter.Next() {
+		v, _, err := kv.V.Value(nil)
+		if err != nil {
+			return err
+		}
+		if err := fn(kv.K, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FirstAndLastInternalKeyOfDataBlock reads the data block at bh and returns
+// the InternalKeys of the first and last entries (in storage-prefix space).
+// The returned UserKey slices are independent copies.
+//
+// Only supported on colblk-format tables.
+func (r *Reader) FirstAndLastInternalKeyOfDataBlock(
+	ctx context.Context, bh block.Handle,
+) (first, last base.InternalKey, _ error) {
+	if !r.tableFormat.BlockColumnar() {
+		return base.InternalKey{}, base.InternalKey{},
+			errors.New("pebble: FirstAndLastInternalKeyOfDataBlock requires colblk-format table")
+	}
+	bufH, err := r.readDataBlock(ctx, block.NoReadEnv, noReadHandle, bh)
+	if err != nil {
+		return base.InternalKey{}, base.InternalKey{}, err
+	}
+	defer bufH.Release()
+	var dec colblk.DataBlockDecoder
+	bd := dec.Init(r.keySchema, bufH.BlockData())
+	var iter colblk.DataBlockIter
+	iter.InitOnce(r.keySchema, r.Comparer, nil /* lazyValuer */, colblk.OptionalColumnConfig{})
+	if err := iter.Init(&dec, bd, blockiter.NoTransforms, colblk.OptionalColumnConfig{}); err != nil {
+		return base.InternalKey{}, base.InternalKey{}, err
+	}
+	defer func() { _ = iter.Close() }()
+	kv := iter.First()
+	if kv == nil {
+		return base.InternalKey{}, base.InternalKey{}, nil
+	}
+	first = base.InternalKey{
+		UserKey: append([]byte(nil), kv.K.UserKey...),
+		Trailer: kv.K.Trailer,
+	}
+	kv = iter.Last()
+	if kv == nil {
+		return first, base.InternalKey{}, nil
+	}
+	last = base.InternalKey{
+		UserKey: append([]byte(nil), kv.K.UserKey...),
+		Trailer: kv.K.Trailer,
+	}
+	return first, last, nil
+}
+
+// FirstAndLastUserKeyOfDataBlock is a thin wrapper around
+// FirstAndLastInternalKeyOfDataBlock returning only the user keys.
+func (r *Reader) FirstAndLastUserKeyOfDataBlock(
+	ctx context.Context, bh block.Handle,
+) (first, last []byte, _ error) {
+	f, l, err := r.FirstAndLastInternalKeyOfDataBlock(ctx, bh)
+	return f.UserKey, l.UserKey, err
 }
 
 // NewReader returns a new table reader for the file. Closing the reader will

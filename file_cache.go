@@ -680,6 +680,17 @@ func (h *fileCacheHandle) newPointIter(
 			r.TryAddBlockPropertyFilterForHideObsoletePoints(
 				opts.snapshotForHideObsoletePoints, file.SeqNums.High, opts.PointKeyFilters)
 
+		// TODO(clone): Block-property filters are computed at write time over
+		// storage-space (Src) keys, so probing them with destination-space (Dst)
+		// keys without inversion would give wrong answers. For VirtualClone v1
+		// we disable block-property filtering entirely on virtual SSTs that
+		// carry a BlockPrefixSubstitution. Inversion-aware probing is the
+		// longer-term fix.
+		if file.BlockPrefixSubstitution.IsSet() {
+			pointKeyFilters = nil
+			internalOpts.boundLimitedFilter = nil
+		}
+
 		var ok bool
 		var err error
 		ok, filterer, err = checkAndIntersectFilters(r, pointKeyFilters,

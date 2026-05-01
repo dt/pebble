@@ -11,6 +11,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
 	"github.com/cockroachdb/pebble/internal/manifest"
+	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable"
 	"github.com/cockroachdb/pebble/sstable/block"
 )
@@ -24,11 +25,10 @@ import (
 //   - A source sstable that uses the row-based block format intersects
 //     srcSpan.
 //   - A source sstable that contains range keys intersects srcSpan.
-//   - A source sstable straddles srcSpan (it extends beyond the in-span
-//     region). A future slice will rewrite the boundary blocks to support
-//     this case.
-//   - The destination region in the LSM is not empty at the level the source
-//     occupies. A future slice will implement smarter level placement.
+//   - A straddling source sstable uses a two-level index (TODO: support).
+//   - A straddling source sstable's in-span data blocks have a stored
+//     block-shared prefix shorter than srcPrefix.
+//   - All levels are saturated for a cloned file (extreme dst-conflict).
 var ErrUnsupportedClone = errors.New("pebble: unsupported VirtualClone case")
 
 // virtualCloneMaxRetries bounds the number of times VirtualClone will retry
@@ -41,21 +41,27 @@ const virtualCloneMaxRetries = 5
 // intersected keys under dstPrefix instead of srcPrefix.
 //
 // srcSpan must lie entirely within [srcPrefix, srcPrefix.ImmediateSuccessor).
-// The destination span [dstPrefix + suffix(srcSpan)] is expected to be empty
-// in the LSM; if it is not, this slice returns ErrUnsupportedClone. (D1: this
-// slice errors on any conflict; sophisticated placement is a TODO.)
 //
-// Atomicity: a single VersionEdit installs all virtual SSTs. On conflict with
-// a concurrent compaction/excise on a referenced source SST, the operation
-// restarts (bounded retry).
+// Atomicity: a single VersionEdit installs all virtual SSTs and any small
+// physical SSTs produced for boundary-block rewrites. On conflict with a
+// concurrent compaction/excise on a referenced source SST, the operation
+// restarts (bounded retry); orphaned boundary SSTs from the failed attempt
+// are cleaned up.
+//
+// Level placement: cloned files are placed top-down, source-floored. Each
+// cloned file is assigned to the deepest level >= its source level whose
+// destination-space bounds don't overlap any existing file at that level.
+// Source files at L0 may be placed at any L0 sublevel down to any deeper
+// level. If even L0 is saturated for a particular cloned file (extreme dst
+// conflict), the operation returns ErrUnsupportedClone.
 //
 // Returns ErrUnsupportedClone (with details) for v1 unsupported cases:
 //   - rowblk-format SSTs intersecting srcSpan
-//   - SSTs that straddle srcSpan (i.e. extend beyond the in-span region)
-//     [D1: this slice errors on straddlers; D2 will rewrite their boundary
-//     blocks]
-//   - any source SST containing range keys (range-key path is deferred)
-//   - destination region not empty (D1: error; future: smarter placement)
+//   - any source SST containing range keys
+//   - a straddling source SST that uses a two-level index
+//   - a straddling source SST whose in-span data blocks have a stored
+//     shared prefix shorter than srcPrefix
+//   - destination region is so saturated no level can host a cloned file
 func (d *DB) VirtualClone(
 	ctx context.Context, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
 ) error {
@@ -108,30 +114,17 @@ func validateVirtualCloneInputs(
 		return errors.Newf("pebble: VirtualClone srcSpan start %q is not before end %q",
 			srcSpan.Start, srcSpan.End)
 	}
-	// srcSpan must lie entirely within [srcPrefix, srcPrefix.ImmediateSuccessor).
-	// We require srcPrefix itself to be a prefix key (Split(srcPrefix) ==
-	// len(srcPrefix)) and srcSpan.Start/End must be at or after srcPrefix and
-	// at or before srcPrefix.ImmediateSuccessor.
 	if cmp.Split == nil || cmp.Split(srcPrefix) != len(srcPrefix) {
 		return errors.New("pebble: VirtualClone srcPrefix must be a prefix key (Split(srcPrefix)==len(srcPrefix))")
 	}
 	if cmp.Split(dstPrefix) != len(dstPrefix) {
 		return errors.New("pebble: VirtualClone dstPrefix must be a prefix key (Split(dstPrefix)==len(dstPrefix))")
 	}
-	// srcSpan.Start must have srcPrefix as a prefix.
 	if !bytes.HasPrefix(srcSpan.Start, srcPrefix) {
 		return errors.Newf(
 			"pebble: VirtualClone srcSpan start %q does not have srcPrefix %q",
 			srcSpan.Start, srcPrefix)
 	}
-	// srcSpan.End must be at most the smallest user key not starting with
-	// srcPrefix, so every key inside srcSpan has srcPrefix as its leading
-	// bytes. We allow either srcSpan.End to itself start with srcPrefix (a
-	// sub-range clone) or srcSpan.End to equal an end-of-prefix marker
-	// computed by appending 0xFF bytes / using the comparer's
-	// ImmediateSuccessor — since we cannot enforce a single canonical end
-	// uniformly across comparers, the per-source-SST check below ensures that
-	// each cloned table's bounds actually start with srcPrefix.
 	return nil
 }
 
@@ -157,23 +150,29 @@ func translateInternalKey(srcPrefix, dstPrefix []byte, k base.InternalKey) base.
 	}
 }
 
-// virtualCloneSource describes a single source sstable that intersects
-// srcSpan and is fully contained within it. Collected during the read phase
-// and consumed by the apply phase.
-type virtualCloneSource struct {
-	level  int
+// clonePlanEntry describes one cloned file (virtual or physical) to install.
+type clonePlanEntry struct {
+	// sourceLevel is the level of the originating source SST (the floor for
+	// destination-level placement).
+	sourceLevel int
+	// source is the source TableMetadata (only set for virtual entries; nil
+	// for boundary-block physical entries).
 	source *manifest.TableMetadata
+	// virtual is the virtual TableMetadata to install. Mutually exclusive with
+	// physical.
+	virtual *manifest.TableMetadata
+	// physical is the physical TableMetadata to install (boundary-block
+	// rewrite). Mutually exclusive with virtual.
+	physical *manifest.TableMetadata
+	// assignedLevel is the level chosen by placeClonedFiles. -1 if not yet
+	// assigned.
+	assignedLevel int
 }
 
-// virtualCloneAttempt performs one attempt at VirtualClone. It returns
-// (retried=true, nil) if the attempt aborted because the LSM mutated between
-// the read phase and the apply phase; the caller may retry. It returns
-// (false, err) on terminal error or (false, nil) on success.
+// virtualCloneAttempt performs one attempt at VirtualClone.
 func (d *DB) virtualCloneAttempt(
 	ctx context.Context, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
 ) (retried bool, _ error) {
-	// Snapshot the current Version + take a ref so the source backings remain
-	// alive through our read phase.
 	d.mu.Lock()
 	currentVersion := d.mu.versions.currentVersion()
 	currentVersion.Ref()
@@ -182,129 +181,82 @@ func (d *DB) virtualCloneAttempt(
 
 	srcSpanBounds := srcSpan.UserKeyBounds()
 
-	// Walk the LSM, classifying intersecting source SSTs.
-	var sources []virtualCloneSource
+	// Track physical SSTs we wrote pre-VE. On any failure path (retry,
+	// terminal error) before the VE applies, we must remove them from the
+	// object provider to avoid orphan files. Mirrors ingest.go's
+	// ingestCleanup pattern (ingest.go:834).
+	var preVEObjects []base.DiskFileNum
+	cleanupPreVE := func() {
+		for _, fn := range preVEObjects {
+			_ = d.objProvider.Remove(base.FileTypeTable, fn)
+		}
+		preVEObjects = nil
+	}
+
+	var entries []clonePlanEntry
+	// Walk LSM in source-level order (L0 sublevels first, then L1..L6),
+	// collecting cloned entries.
 	for layer, ls := range currentVersion.AllLevelsAndSublevels() {
 		level := layer.Level()
 		for m := range ls.Overlaps(d.cmp, srcSpanBounds).All() {
-			// Range keys: deferred.
 			if m.HasRangeKeys {
+				cleanupPreVE()
 				return false, errors.Wrapf(ErrUnsupportedClone,
 					"source table %s at L%d intersecting srcSpan contains range keys",
 					m.TableNum, level)
 			}
-			// Reject straddlers: source SST must be fully contained.
-			if !srcSpanBounds.ContainsInternalKey(d.cmp, m.Smallest()) ||
-				!srcSpanBounds.ContainsInternalKey(d.cmp, m.Largest()) {
-				return false, errors.Wrapf(ErrUnsupportedClone,
-					"source table %s at L%d straddles srcSpan boundary (smallest=%s largest=%s)",
-					m.TableNum, level,
-					m.Smallest().Pretty(d.opts.Comparer.FormatKey),
-					m.Largest().Pretty(d.opts.Comparer.FormatKey))
+			fullyContained := srcSpanBounds.ContainsInternalKey(d.cmp, m.Smallest()) &&
+				srcSpanBounds.ContainsInternalKey(d.cmp, m.Largest())
+			if fullyContained {
+				if !bytes.HasPrefix(m.Smallest().UserKey, srcPrefix) ||
+					!bytes.HasPrefix(m.Largest().UserKey, srcPrefix) {
+					cleanupPreVE()
+					return false, errors.Wrapf(ErrUnsupportedClone,
+						"source table %s at L%d has bounds outside srcPrefix %q (smallest=%s largest=%s)",
+						m.TableNum, level, srcPrefix,
+						m.Smallest().Pretty(d.opts.Comparer.FormatKey),
+						m.Largest().Pretty(d.opts.Comparer.FormatKey))
+				}
+				vm, err := d.buildFullyContainedVirtual(m, srcPrefix, dstPrefix)
+				if err != nil {
+					cleanupPreVE()
+					return false, err
+				}
+				entries = append(entries, clonePlanEntry{
+					sourceLevel:   level,
+					source:        m,
+					virtual:       vm,
+					assignedLevel: -1,
+				})
+				continue
 			}
-			// Defense in depth: confirm that both bound user keys actually start
-			// with srcPrefix. The substitution would produce nonsense (or panic)
-			// for keys that don't carry srcPrefix as their leading bytes.
-			if !bytes.HasPrefix(m.Smallest().UserKey, srcPrefix) ||
-				!bytes.HasPrefix(m.Largest().UserKey, srcPrefix) {
-				return false, errors.Wrapf(ErrUnsupportedClone,
-					"source table %s at L%d has bounds outside srcPrefix %q (smallest=%s largest=%s)",
-					m.TableNum, level, srcPrefix,
-					m.Smallest().Pretty(d.opts.Comparer.FormatKey),
-					m.Largest().Pretty(d.opts.Comparer.FormatKey))
+			// Straddler: open the source, read its index, classify blocks,
+			// build a block-aligned virtual TableMetadata + 0-2 boundary
+			// physical SSTs.
+			straddlerEntries, written, err := d.buildStraddlerEntries(
+				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix)
+			if err != nil {
+				// Track any objects already written before propagating.
+				preVEObjects = append(preVEObjects, written...)
+				cleanupPreVE()
+				return false, err
 			}
-			// Reject row-based table formats. We need to open the file to check
-			// its format. Use the file cache without the DB mutex held.
-			var isRowblk bool
-			if err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
-				func(r *sstable.Reader, _ sstable.ReadEnv) error {
-					format, err := r.TableFormat()
-					if err != nil {
-						return err
-					}
-					isRowblk = !format.BlockColumnar()
-					return nil
-				}); err != nil {
-				return false, errors.Wrapf(err,
-					"pebble: VirtualClone failed to read format of source table %s", m.TableNum)
-			}
-			if isRowblk {
-				return false, errors.Wrapf(ErrUnsupportedClone,
-					"source table %s at L%d uses the row-based block format",
-					m.TableNum, level)
-			}
-			sources = append(sources, virtualCloneSource{level: level, source: m})
+			preVEObjects = append(preVEObjects, written...)
+			entries = append(entries, straddlerEntries...)
 		}
 	}
 
-	// Empty src span: no-op.
-	if len(sources) == 0 {
+	if len(entries) == 0 {
 		return false, nil
 	}
 
-	// Build virtual TableMetadata entries. We allocate TableNums up front; if
-	// the apply phase fails these become unused holes in the namespace, which
-	// is acceptable (the same is true for ingest's pre-VE physical SSTs).
-	type virtualEntry struct {
-		level   int
-		source  *manifest.TableMetadata
-		virtual *manifest.TableMetadata
-	}
-	entries := make([]virtualEntry, 0, len(sources))
-	for _, src := range sources {
-		m := src.source
-		vm := &manifest.TableMetadata{
-			Virtual:               true,
-			TableNum:              d.mu.versions.getNextTableNum(),
-			SeqNums:               m.SeqNums,
-			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
-			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
-				Src: append([]byte(nil), srcPrefix...),
-				Dst: append([]byte(nil), dstPrefix...),
-			},
-		}
-		// Translate the per-key-type bounds (not the overall bounds) so that
-		// HasPointKeys/HasRangeKeys and PointKeyBounds/RangeKeyBounds are
-		// populated correctly via ExtendPointKeyBounds/ExtendRangeKeyBounds.
-		// We rejected sources with range keys above, so HasPointKeys must be
-		// true here.
-		if !m.HasPointKeys {
-			return false, errors.AssertionFailedf(
-				"pebble: VirtualClone source table %s has no point keys", m.TableNum)
-		}
-		smallest := translateInternalKey(srcPrefix, dstPrefix, m.PointKeyBounds.Smallest())
-		largest := translateInternalKey(srcPrefix, dstPrefix, m.PointKeyBounds.Largest())
-		vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
-
-		vm.AttachVirtualBacking(m.TableBacking)
-		// Size: D1 reuses the source's size as an approximation. The cloned
-		// virtual table covers the entirety of the source (fully-contained
-		// case), so this is a tight upper bound.
-		vm.Size = m.Size
-		if vm.Size == 0 {
-			vm.Size = 1
-		}
-		// Blob references are scaled the same way excise does it. For a
-		// fully-contained clone the ratio is 1.
-		determineExcisedTableBlobReferences(m.BlobReferences, m.Size, vm, d.FormatMajorVersion())
-
-		if err := vm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
-			return false, errors.Wrapf(err,
-				"pebble: VirtualClone produced invalid virtual table for source %s", m.TableNum)
-		}
-		vm.ValidateVirtual(m)
-
-		entries = append(entries, virtualEntry{
-			level:   src.level,
-			source:  m,
-			virtual: vm,
-		})
+	// Assign levels top-down with source-level floor.
+	if err := assignClonedFileLevels(d.cmp, currentVersion, entries); err != nil {
+		cleanupPreVE()
+		return false, err
 	}
 
-	// Apply via UpdateVersionLocked. The callback re-snapshots the current
-	// version and validates that every source backing still exists and is
-	// still resident at the level we intend to slot the virtual file at. If
-	// not, we abort and request a retry.
+	// Apply via UpdateVersionLocked.
 	d.mu.Lock()
 	jobID := d.newJobIDLocked()
 	defer d.mu.Unlock()
@@ -313,59 +265,66 @@ func (d *DB) virtualCloneAttempt(
 	_, err := d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
 		current := d.mu.versions.currentVersion()
 
-		// Re-validate every source backing still exists in the latest virtual
-		// backings set OR the source is still a non-virtual file in current.
-		// We also confirm the source is still present at the same level it was
-		// observed at; if it has moved, restart so the level placement is
-		// recomputed against the new shape.
+		// Re-validate every source backing still exists at the level we
+		// observed during the read phase. If anything has shifted, abort.
 		for _, e := range entries {
-			if !current.Contains(e.level, e.source) {
+			if e.source == nil {
+				continue
+			}
+			if !current.Contains(e.sourceLevel, e.source) {
 				aborted = true
 				return versionUpdate{}, nil
 			}
 		}
-
-		// D1 simple level placement: try to place each virtual file at the
-		// same level as its source. If anything at that level overlaps the
-		// new file's dst-space bounds, return ErrUnsupportedClone.
+		// Re-validate placement: at the assigned level, the cloned file's
+		// bounds must still not overlap. If overlap appeared (concurrent
+		// compaction installed a new file), abort to recompute.
 		for _, e := range entries {
-			vmBounds := e.virtual.UserKeyBounds()
-			if current.HasOverlap(e.level, vmBounds) {
-				return versionUpdate{}, errors.Wrapf(ErrUnsupportedClone,
-					"destination region overlaps existing data at L%d for cloned table %s",
-					e.level, e.virtual.TableNum)
+			meta := e.virtual
+			if meta == nil {
+				meta = e.physical
 			}
+			if e.assignedLevel > 0 {
+				if current.HasOverlap(e.assignedLevel, meta.UserKeyBounds()) {
+					aborted = true
+					return versionUpdate{}, nil
+				}
+			}
+			// L0 always tolerates overlap.
 		}
 
-		// Build the version edit.
 		ve := &manifest.VersionEdit{}
-		// Track which backings we've already added to CreatedBackingTables in
-		// this VE: a single backing might be referenced by multiple cloned
-		// virtual files, but per CreatedBackingTables invariants each backing
-		// is added at most once per VE. A backing is "new" to the
-		// virtualBackings set if it's not currently present (i.e. the source
-		// is a non-virtual table).
 		seenNewBacking := make(map[base.DiskFileNum]struct{})
 		for _, e := range entries {
+			meta := e.virtual
+			if meta == nil {
+				meta = e.physical
+			}
 			ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
-				Level: e.level,
-				Meta:  e.virtual,
+				Level: e.assignedLevel,
+				Meta:  meta,
 			})
-			backingNum := e.source.TableBacking.DiskFileNum
-			if _, ok := d.mu.versions.latest.virtualBackings.Get(backingNum); ok {
-				continue
+			if e.virtual != nil {
+				backingNum := e.source.TableBacking.DiskFileNum
+				if _, ok := d.mu.versions.latest.virtualBackings.Get(backingNum); ok {
+					continue
+				}
+				if _, ok := seenNewBacking[backingNum]; ok {
+					continue
+				}
+				seenNewBacking[backingNum] = struct{}{}
+				ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
 			}
-			if _, ok := seenNewBacking[backingNum]; ok {
-				continue
-			}
-			seenNewBacking[backingNum] = struct{}{}
-			ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
 		}
 
 		var metrics levelMetricsDelta
 		for _, e := range entries {
-			levelMetrics := metrics.level(e.level)
-			levelMetrics.TablesIngested.Inc(e.virtual.Size)
+			meta := e.virtual
+			if meta == nil {
+				meta = e.physical
+			}
+			levelMetrics := metrics.level(e.assignedLevel)
+			levelMetrics.TablesIngested.Inc(meta.Size)
 		}
 
 		return versionUpdate{
@@ -376,13 +335,549 @@ func (d *DB) virtualCloneAttempt(
 		}, nil
 	})
 	if err != nil {
+		cleanupPreVE()
 		return false, err
 	}
 	if aborted {
+		cleanupPreVE()
 		return true, nil
 	}
-	// Publish the new version through the read state so subsequent reads see
-	// the cloned files.
 	d.updateReadStateLocked(d.opts.DebugCheck)
 	return false, nil
+}
+
+// buildFullyContainedVirtual produces a virtual TableMetadata for a source
+// table whose bounds lie entirely within srcSpan.
+func (d *DB) buildFullyContainedVirtual(
+	m *manifest.TableMetadata, srcPrefix, dstPrefix []byte,
+) (*manifest.TableMetadata, error) {
+	// Reject row-based table format (no per-block stored shared prefix).
+	var isRowblk bool
+	if err := d.fileCache.withReader(context.TODO(), block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			format, err := r.TableFormat()
+			if err != nil {
+				return err
+			}
+			isRowblk = !format.BlockColumnar()
+			return nil
+		}); err != nil {
+		return nil, errors.Wrapf(err,
+			"pebble: VirtualClone failed to read format of source table %s", m.TableNum)
+	}
+	if isRowblk {
+		return nil, errors.Wrapf(ErrUnsupportedClone,
+			"source table %s uses the row-based block format", m.TableNum)
+	}
+
+	if !m.HasPointKeys {
+		return nil, errors.AssertionFailedf(
+			"pebble: VirtualClone source table %s has no point keys", m.TableNum)
+	}
+
+	vm := &manifest.TableMetadata{
+		Virtual:               true,
+		TableNum:              d.mu.versions.getNextTableNum(),
+		SeqNums:               m.SeqNums,
+		LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+		BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
+			Src: append([]byte(nil), srcPrefix...),
+			Dst: append([]byte(nil), dstPrefix...),
+		},
+	}
+	smallest := translateInternalKey(srcPrefix, dstPrefix, m.PointKeyBounds.Smallest())
+	largest := translateInternalKey(srcPrefix, dstPrefix, m.PointKeyBounds.Largest())
+	vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
+
+	vm.AttachVirtualBacking(m.TableBacking)
+	vm.Size = m.Size
+	if vm.Size == 0 {
+		vm.Size = 1
+	}
+	determineExcisedTableBlobReferences(m.BlobReferences, m.Size, vm, d.FormatMajorVersion())
+
+	if err := vm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+		return nil, errors.Wrapf(err,
+			"pebble: VirtualClone produced invalid virtual table for source %s", m.TableNum)
+	}
+	vm.ValidateVirtual(m)
+	return vm, nil
+}
+
+// buildStraddlerEntries handles a single straddling source SST. It reads the
+// SST's index, identifies the contiguous run of in-span data blocks and the
+// at-most-two boundary blocks, validates the per-block precondition, builds a
+// block-aligned virtual TableMetadata, and writes one physical SST per
+// non-empty boundary block.
+//
+// On error, any objects that have already been written to the object provider
+// are returned in `written` so the caller can clean them up.
+func (d *DB) buildStraddlerEntries(
+	ctx context.Context,
+	m *manifest.TableMetadata,
+	level int,
+	srcSpan KeyRange,
+	srcSpanBounds base.UserKeyBounds,
+	srcPrefix, dstPrefix []byte,
+) (entries []clonePlanEntry, written []base.DiskFileNum, _ error) {
+	if !m.HasPointKeys {
+		return nil, nil, errors.AssertionFailedf(
+			"pebble: VirtualClone source table %s has no point keys", m.TableNum)
+	}
+
+	var blocks []blockInfo
+
+	var isRowblk bool
+	var twoLevel bool
+
+	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			format, err := r.TableFormat()
+			if err != nil {
+				return err
+			}
+			if !format.BlockColumnar() {
+				isRowblk = true
+				return nil
+			}
+			// TODO(clone): support two-level indexes. For now, defer.
+			if r.Attributes.Has(sstable.AttributeTwoLevelIndex) {
+				twoLevel = true
+				return nil
+			}
+			return r.WalkDataBlocks(ctx, func(e sstable.DataBlockEntry) error {
+				blocks = append(blocks, blockInfo{
+					separator: append([]byte(nil), e.Separator...),
+					handle:    e.Handle,
+				})
+				return nil
+			})
+		})
+	if err != nil {
+		return nil, nil, errors.Wrapf(err,
+			"pebble: VirtualClone failed to read index of source table %s", m.TableNum)
+	}
+	if isRowblk {
+		return nil, nil, errors.Wrapf(ErrUnsupportedClone,
+			"source table %s at L%d uses the row-based block format", m.TableNum, level)
+	}
+	if twoLevel {
+		return nil, nil, errors.Wrapf(ErrUnsupportedClone,
+			"source table %s at L%d is a straddler using a two-level index (TODO: supported in a follow-up)",
+			m.TableNum, level)
+	}
+	if len(blocks) == 0 {
+		return nil, nil, errors.AssertionFailedf(
+			"pebble: VirtualClone source table %s has no data blocks", m.TableNum)
+	}
+
+	// Classify each block by its key range relative to srcSpan. A block's
+	// upper bound (inclusive) is its separator. A block's lower bound is the
+	// previous block's separator (exclusive), or the table's smallest user
+	// key (inclusive) for block 0.
+	//
+	// in-span: lower >= srcSpan.Start AND separator < srcSpan.End
+	// boundary-lo: separator >= srcSpan.Start AND lower < srcSpan.Start
+	// boundary-hi: lower < srcSpan.End AND separator >= srcSpan.End
+	// outside: separator < srcSpan.Start OR lower >= srcSpan.End
+
+	cmp := d.cmp
+	// firstInSpan and lastInSpan delimit the contiguous in-span run (closed
+	// interval); -1 means no in-span block.
+	firstInSpan, lastInSpan := -1, -1
+	// boundaryLo and boundaryHi are the 0-or-1 boundary block indices.
+	boundaryLo, boundaryHi := -1, -1
+
+	tableSmallest := m.Smallest().UserKey
+	for i, blk := range blocks {
+		var lower []byte
+		if i == 0 {
+			lower = tableSmallest
+		} else {
+			// Lower exclusive bound = previous block's separator. We treat it
+			// inclusively for classification: a block whose first key equals
+			// the previous separator can still happen in principle. We use the
+			// previous separator as a lower-bound proxy.
+			lower = blocks[i-1].separator
+		}
+		sep := blk.separator
+
+		// Block is fully outside srcSpan if separator < srcSpan.Start (entirely
+		// before) or lower >= srcSpan.End (entirely after).
+		if cmp(sep, srcSpan.Start) < 0 {
+			continue
+		}
+		if cmp(lower, srcSpan.End) >= 0 {
+			continue
+		}
+		// Block at least partially intersects srcSpan.
+		lowerInSpan := cmp(lower, srcSpan.Start) >= 0
+		// For "fully in-span" we need separator strictly less than srcSpan.End.
+		// (separator equals last-key, last key < srcSpan.End requires sep < End.)
+		upperInSpan := cmp(sep, srcSpan.End) < 0
+		switch {
+		case lowerInSpan && upperInSpan:
+			if firstInSpan == -1 {
+				firstInSpan = i
+			}
+			lastInSpan = i
+		case !lowerInSpan && upperInSpan:
+			// Boundary-lo block.
+			if boundaryLo != -1 {
+				return nil, nil, errors.AssertionFailedf(
+					"pebble: VirtualClone source %s has multiple lo-boundary blocks", m.TableNum)
+			}
+			boundaryLo = i
+		case lowerInSpan && !upperInSpan:
+			// Boundary-hi block.
+			if boundaryHi != -1 {
+				return nil, nil, errors.AssertionFailedf(
+					"pebble: VirtualClone source %s has multiple hi-boundary blocks", m.TableNum)
+			}
+			boundaryHi = i
+		case !lowerInSpan && !upperInSpan:
+			// Single block straddling both ends — use it as both.
+			if boundaryLo != -1 || boundaryHi != -1 {
+				return nil, nil, errors.AssertionFailedf(
+					"pebble: VirtualClone source %s has both boundaries in a single block but other boundaries already set",
+					m.TableNum)
+			}
+			boundaryLo = i
+			// The same block carries both boundaries; we'll iterate it once.
+			boundaryHi = -1
+		}
+	}
+
+	// Build virtual entry for the in-span run, if any.
+	if firstInSpan >= 0 {
+		// Per-block precondition validation: every in-span block's stored
+		// shared prefix must start with srcPrefix.
+		if err := d.validateInSpanBlocks(ctx, m, blocks[firstInSpan:lastInSpan+1], srcPrefix); err != nil {
+			return nil, nil, err
+		}
+
+		// Block-aligned bounds in dst-space. The virtual SST covers blocks
+		// [firstInSpan..lastInSpan]. Its smallest is the lower bound of
+		// block firstInSpan; its largest is the separator of lastInSpan.
+		// We use the previous block's separator (or tableSmallest for the
+		// first block) as the smallest bound. If we use a separator that
+		// belongs to a boundary block, we need to be careful that the bound
+		// actually skips the boundary block. The previous separator is <
+		// any key in firstInSpan, so smallest := first key of block
+		// firstInSpan. Since iteration uses these as user-key bounds, using
+		// blocks[firstInSpan-1].separator as exclusive smallest could
+		// include boundary keys. Safer: use the first key of block
+		// firstInSpan itself.
+		//
+		// We materialize the smallest/largest by reading the data blocks at
+		// the run's endpoints (we will read these blocks once anyway for
+		// validation). To minimize complexity, we re-derive smallest =
+		// firstKeyOf(blocks[firstInSpan]) and largest =
+		// lastKeyOf(blocks[lastInSpan]). validateInSpanBlocks already opens
+		// these blocks; we extract while we're there.
+		firstIK, lastIK, err := d.firstAndLastKeyOfRun(ctx, m, blocks[firstInSpan], blocks[lastInSpan])
+		if err != nil {
+			return nil, nil, err
+		}
+		// Translate into dst-space, preserving original trailers.
+		smallest := translateInternalKey(srcPrefix, dstPrefix, firstIK)
+		largest := translateInternalKey(srcPrefix, dstPrefix, lastIK)
+
+		vm := &manifest.TableMetadata{
+			Virtual:               true,
+			TableNum:              d.mu.versions.getNextTableNum(),
+			SeqNums:               m.SeqNums,
+			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
+				Src: append([]byte(nil), srcPrefix...),
+				Dst: append([]byte(nil), dstPrefix...),
+			},
+		}
+		vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
+
+		vm.AttachVirtualBacking(m.TableBacking)
+		// Approximate size by proportion of in-span blocks to total blocks.
+		approx := uint64(0)
+		for _, b := range blocks[firstInSpan : lastInSpan+1] {
+			approx += b.handle.Length
+		}
+		vm.Size = approx
+		if vm.Size == 0 {
+			vm.Size = 1
+		}
+		determineExcisedTableBlobReferences(m.BlobReferences, m.Size, vm, d.FormatMajorVersion())
+
+		if err := vm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+			return nil, nil, errors.Wrapf(err,
+				"pebble: VirtualClone produced invalid virtual table for source %s", m.TableNum)
+		}
+		vm.ValidateVirtual(m)
+
+		entries = append(entries, clonePlanEntry{
+			sourceLevel:   level,
+			source:        m,
+			virtual:       vm,
+			assignedLevel: -1,
+		})
+	}
+
+	// Boundary-block rewrites.
+	maybeRewrite := func(idx int) error {
+		if idx < 0 {
+			return nil
+		}
+		// Skip if this boundary block is the same as the in-span run (which
+		// shouldn't happen by construction, but be safe).
+		if idx >= firstInSpan && idx <= lastInSpan && firstInSpan >= 0 {
+			return nil
+		}
+		physical, fileNum, err := d.rewriteBoundaryBlock(
+			ctx, m, blocks[idx].handle.Handle, srcSpan, srcSpanBounds,
+			srcPrefix, dstPrefix, level)
+		if err != nil {
+			return err
+		}
+		if physical == nil {
+			// Empty boundary (no in-span keys).
+			return nil
+		}
+		written = append(written, fileNum)
+		entries = append(entries, clonePlanEntry{
+			sourceLevel:   level,
+			physical:      physical,
+			assignedLevel: -1,
+		})
+		return nil
+	}
+
+	if err := maybeRewrite(boundaryLo); err != nil {
+		return entries, written, err
+	}
+	if err := maybeRewrite(boundaryHi); err != nil {
+		return entries, written, err
+	}
+	return entries, written, nil
+}
+
+// blockInfo is a small (separator, handle) pair used in straddler analysis.
+type blockInfo struct {
+	separator []byte
+	handle    block.HandleWithProperties
+}
+
+// validateInSpanBlocks reads each of the provided blocks and verifies that
+// every key in the block starts with srcPrefix. For blocks fully within
+// srcSpan ⊆ [srcPrefix, srcPrefix.next), this holds by construction; the
+// check is defense in depth against pathological key layouts or comparer
+// Separator behavior that produces a block whose stored shared prefix is
+// shorter than srcPrefix.
+func (d *DB) validateInSpanBlocks(
+	ctx context.Context, m *manifest.TableMetadata, blocks []blockInfo, srcPrefix []byte,
+) error {
+	if len(blocks) == 0 {
+		return nil
+	}
+	return d.fileCache.withReader(ctx, block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			for _, b := range blocks {
+				first, last, err := r.FirstAndLastUserKeyOfDataBlock(ctx, b.handle.Handle)
+				if err != nil {
+					return errors.Wrapf(err,
+						"pebble: VirtualClone failed reading data block of source %s", m.TableNum)
+				}
+				if !bytes.HasPrefix(first, srcPrefix) || !bytes.HasPrefix(last, srcPrefix) {
+					return errors.Wrapf(ErrUnsupportedClone,
+						"source table %s has an in-span data block whose key range is not entirely within srcPrefix %q (first=%q last=%q)",
+						m.TableNum, srcPrefix, first, last)
+				}
+			}
+			return nil
+		})
+}
+
+// firstAndLastKeyOfRun returns the first InternalKey of firstBlock and the
+// last InternalKey of lastBlock, in storage-prefix space.
+func (d *DB) firstAndLastKeyOfRun(
+	ctx context.Context, m *manifest.TableMetadata, firstBlock, lastBlock blockInfo,
+) (first, last base.InternalKey, _ error) {
+	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			f, l, err := r.FirstAndLastInternalKeyOfDataBlock(ctx, firstBlock.handle.Handle)
+			if err != nil {
+				return err
+			}
+			first = f
+			if firstBlock.handle.Offset == lastBlock.handle.Offset {
+				last = l
+				return nil
+			}
+			_, l, err = r.FirstAndLastInternalKeyOfDataBlock(ctx, lastBlock.handle.Handle)
+			if err != nil {
+				return err
+			}
+			last = l
+			return nil
+		})
+	return first, last, err
+}
+
+// rewriteBoundaryBlock decodes the boundary block referenced by bh, selects
+// the keys whose user keys lie within srcSpan, translates each to dst space,
+// and writes them to a new physical SST. Returns nil for the metadata if no
+// in-span keys exist (degenerate case).
+//
+// The returned DiskFileNum identifies the object so the caller can clean it
+// up if a later step fails before the VE applies.
+func (d *DB) rewriteBoundaryBlock(
+	ctx context.Context,
+	m *manifest.TableMetadata,
+	bh block.Handle,
+	srcSpan KeyRange,
+	srcSpanBounds base.UserKeyBounds,
+	srcPrefix, dstPrefix []byte,
+	level int,
+) (*manifest.TableMetadata, base.DiskFileNum, error) {
+	cmp := d.cmp
+
+	// Collect (translatedKey, value) pairs for in-span keys.
+	type kvPair struct {
+		key   base.InternalKey
+		value []byte
+	}
+	var pairs []kvPair
+	if err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			return r.IterateDataBlock(ctx, bh, func(k base.InternalKey, v []byte) error {
+				if !srcSpanBounds.ContainsInternalKey(cmp, k) {
+					return nil
+				}
+				translated := translateInternalKey(srcPrefix, dstPrefix, k)
+				pairs = append(pairs, kvPair{
+					key:   translated,
+					value: append([]byte(nil), v...),
+				})
+				return nil
+			})
+		}); err != nil {
+		return nil, 0, errors.Wrapf(err,
+			"pebble: VirtualClone failed iterating boundary block of source %s", m.TableNum)
+	}
+	if len(pairs) == 0 {
+		return nil, 0, nil
+	}
+
+	// Allocate a new physical file and write the SST.
+	tableNum := d.mu.versions.getNextTableNum()
+	fileNum := base.PhysicalTableDiskFileNum(tableNum)
+
+	writable, _, err := d.objProvider.Create(ctx, base.FileTypeTable, fileNum,
+		objstorage.CreateOptions{PreferSharedStorage: false})
+	if err != nil {
+		return nil, 0, errors.Wrapf(err,
+			"pebble: VirtualClone failed to create boundary SST object")
+	}
+
+	writerOpts := d.opts.MakeWriterOptions(level, d.TableFormat())
+	tw := sstable.NewRawWriter(writable, writerOpts)
+	for _, p := range pairs {
+		if err := tw.Add(p.key, p.value, false /* forceObsolete */, base.KVMeta{}); err != nil {
+			_ = tw.Close()
+			_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+			return nil, 0, errors.Wrapf(err, "pebble: VirtualClone boundary write")
+		}
+	}
+	if err := tw.Close(); err != nil {
+		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+		return nil, 0, errors.Wrapf(err, "pebble: VirtualClone boundary close")
+	}
+	wm, err := tw.Metadata()
+	if err != nil {
+		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+		return nil, 0, errors.Wrapf(err, "pebble: VirtualClone boundary metadata")
+	}
+
+	pm := &manifest.TableMetadata{
+		TableNum:              tableNum,
+		Size:                  wm.Size,
+		SeqNums:               m.SeqNums,
+		LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+	}
+	pm.ExtendPointKeyBounds(d.cmp, wm.SmallestPoint, wm.LargestPoint)
+	pm.InitPhysicalBacking()
+	if err := pm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+		return nil, 0, errors.Wrapf(err,
+			"pebble: VirtualClone boundary table %s is invalid", pm.TableNum)
+	}
+	return pm, fileNum, nil
+}
+
+// assignClonedFileLevels assigns each entry's destination level using a
+// top-down, source-floor algorithm. Entries are processed in source-level
+// order (already the order produced by the caller). For each entry, walk
+// levels from the source level down to L6, picking the first deeper level
+// where the entry's dst-bounds don't overlap any existing file. Already-
+// assigned cloned files at the candidate level are also taken into account.
+// If no level (down to L6) is suitable, the entry is placed at the source
+// level (where the caller will detect the overlap and abort if necessary).
+//
+// L0 is special: a file originating at L0 may always be placed somewhere in
+// L0 or below; we treat L0 as always available.
+func assignClonedFileLevels(
+	cmp base.Compare, current *manifest.Version, entries []clonePlanEntry,
+) error {
+	// Track in-progress placements at each level so subsequent entries see
+	// each other's bounds.
+	type placedBound struct {
+		bounds base.UserKeyBounds
+	}
+	placed := make(map[int][]placedBound)
+	overlapsPlaced := func(level int, b base.UserKeyBounds) bool {
+		for _, p := range placed[level] {
+			pBounds := p.bounds
+			if pBounds.Overlaps(cmp, b) {
+				return true
+			}
+		}
+		return false
+	}
+
+	for i := range entries {
+		e := &entries[i]
+		meta := e.virtual
+		if meta == nil {
+			meta = e.physical
+		}
+		bounds := meta.UserKeyBounds()
+
+		startLevel := e.sourceLevel
+		// Walk from source level down to L6, looking for a level whose
+		// existing files don't overlap our bounds.
+		bestLevel := -1
+		for level := numLevels - 1; level >= startLevel; level-- {
+			if level == 0 {
+				// L0 always accepts overlap.
+				bestLevel = level
+				continue
+			}
+			if !current.HasOverlap(level, bounds) && !overlapsPlaced(level, bounds) {
+				bestLevel = level
+				// Prefer deepest level (lower write-amp later); since we walk
+				// from L6 upward, we record the first non-overlap and break.
+				break
+			}
+		}
+		// If even L0 isn't usable (we never set bestLevel), error.
+		if bestLevel == -1 {
+			// startLevel could be > 0; we may have walked startLevel..L6 and
+			// found nothing. Try L0 as a last resort if startLevel > 0.
+			// Actually our floor is startLevel; we cannot go shallower.
+			return errors.Wrapf(ErrUnsupportedClone,
+				"VirtualClone: no level >= L%d (source level) is free of overlap for cloned table %s",
+				startLevel, meta.TableNum)
+		}
+		e.assignedLevel = bestLevel
+		placed[bestLevel] = append(placed[bestLevel], placedBound{bounds: bounds})
+	}
+	return nil
 }
