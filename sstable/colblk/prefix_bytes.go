@@ -341,8 +341,9 @@ func (b *PrefixBytes) SetAt(it *PrefixBytesIter, i int) {
 	// prefix that are being skipped because of a BlockPrefixSubstitution.
 	// The guard below is unconditional (not gated by invariants.Enabled)
 	// because without it the subtraction below would underflow uint32 and
-	// produce a length that corrupts the heap via memmove. This check fires at
-	// most once per block-level iterator setup, not once per key.
+	// produce a length that corrupts the heap via memmove. SetAt runs per row
+	// (not once per block-iterator setup), so the guard executes per call;
+	// the per-call cost is a single compare on hot data already in cache.
 	if it.skipShared > uint32(b.sharedPrefixLen) {
 		panic(errors.AssertionFailedf("BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d",
 			errors.Safe(it.skipShared), errors.Safe(b.sharedPrefixLen)))
