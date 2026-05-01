@@ -32,6 +32,90 @@ func TestTransforms(t *testing.T) {
 	transforms = NoTransforms
 	transforms.SyntheticPrefixAndSuffix = MakeSyntheticPrefixAndSuffix([]byte{}, []byte{1})
 	require.False(t, transforms.NoTransforms())
+
+	// A BlockPrefixSubstitution with non-empty Src disables the noTransforms
+	// fast path. This locks in the invariant that callers using the
+	// substitution cannot accidentally take the no-transform code path which
+	// would emit untranslated keys.
+	transforms = NoTransforms
+	transforms.BlockPrefixSubstitution = BlockPrefixSubstitution{Src: []byte("/a/"), Dst: []byte("/b/")}
+	require.True(t, transforms.BlockPrefixSubstitution.IsSet())
+	require.False(t, transforms.NoTransforms())
+}
+
+func TestBlockPrefixSubstitution(t *testing.T) {
+	// IsSet requires a non-empty Src; a non-empty Dst alone does not count.
+	require.False(t, BlockPrefixSubstitution{}.IsSet())
+	require.False(t, BlockPrefixSubstitution{Dst: []byte("/x/")}.IsSet())
+	require.True(t, BlockPrefixSubstitution{Src: []byte("/x/")}.IsSet())
+	require.True(t, BlockPrefixSubstitution{Src: []byte("/a/"), Dst: []byte("/b/")}.IsSet())
+
+	// Round-trip Apply/Invert for a variety of key shapes.
+	cases := []struct {
+		name string
+		src  []byte
+		dst  []byte
+		keys [][]byte
+	}{
+		{
+			name: "equal-length",
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/4/"),
+			keys: [][]byte{
+				[]byte("/tenant/1/"), // exactly Src
+				[]byte("/tenant/1/a"),
+				[]byte("/tenant/1/abcdef"),
+			},
+		},
+		{
+			name: "longer-dst",
+			src:  []byte("/t/1/"),
+			dst:  []byte("/tenant/very-long/"),
+			keys: [][]byte{
+				[]byte("/t/1/"),
+				[]byte("/t/1/x"),
+			},
+		},
+		{
+			name: "shorter-dst",
+			src:  []byte("/tenant/12345/"),
+			dst:  []byte("/t/9/"),
+			keys: [][]byte{
+				[]byte("/tenant/12345/"),
+				[]byte("/tenant/12345/zzz"),
+			},
+		},
+		{
+			name: "empty-dst-pure-strip",
+			src:  []byte("/tenant/1/"),
+			dst:  nil,
+			keys: [][]byte{
+				[]byte("/tenant/1/"),
+				[]byte("/tenant/1/foo"),
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := BlockPrefixSubstitution{Src: tc.src, Dst: tc.dst}
+			for _, k := range tc.keys {
+				applied := s.Apply(k)
+				inverted := s.Invert(applied)
+				require.Equal(t, string(k), string(inverted),
+					"Invert(Apply(%q)) = %q, expected %q", k, inverted, k)
+			}
+		})
+	}
+
+	// Apply panics on a key that does not start with Src.
+	s := BlockPrefixSubstitution{Src: []byte("/a/"), Dst: []byte("/b/")}
+	require.Panics(t, func() { s.Apply([]byte("/x/foo")) })
+	// Invert panics on a key that does not start with Dst.
+	require.Panics(t, func() { s.Invert([]byte("/x/foo")) })
+	// Apply panics if Src is empty (callers should use SyntheticPrefix).
+	require.Panics(t, func() {
+		(BlockPrefixSubstitution{Dst: []byte("/b/")}).Apply([]byte("foo"))
+	})
 }
 
 func TestFragmentTransforms(t *testing.T) {

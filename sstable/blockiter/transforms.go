@@ -63,18 +63,20 @@ func (t *Transforms) SyntheticSuffix() []byte {
 
 // FragmentTransforms allow on-the-fly transformation of range deletion or
 // range key data at iteration time.
+//
+// Note: BlockPrefixSubstitution is intentionally not represented here. The
+// fragment iterators (range del / range key) do not yet apply the
+// substitution, and silently carrying the field would risk emitting
+// untranslated boundary keys. Range-key support is deferred.
 type FragmentTransforms struct {
 	SyntheticSeqNum          SyntheticSeqNum
 	SyntheticPrefixAndSuffix SyntheticPrefixAndSuffix
-	BlockPrefixSubstitution  BlockPrefixSubstitution
 }
 
 // NoTransforms returns true if there are no transforms enabled.
 func (t *FragmentTransforms) NoTransforms() bool {
-	// NoTransforms returns true if there are no transforms enabled.
 	return t.SyntheticSeqNum == 0 &&
-		t.SyntheticPrefixAndSuffix.IsUnset() &&
-		!t.BlockPrefixSubstitution.IsSet()
+		t.SyntheticPrefixAndSuffix.IsUnset()
 }
 
 func (t *FragmentTransforms) HasSyntheticPrefix() bool {
@@ -286,15 +288,25 @@ type BlockPrefixSubstitution struct {
 	Dst []byte
 }
 
-// IsSet returns true if the substitution is non-empty (either side has bytes).
+// IsSet returns true if the substitution is configured to strip and replace a
+// non-empty source prefix. A non-empty Src is the load-bearing precondition
+// for the transform: without Src there is nothing to substitute, so a
+// substitution with an empty Src and a non-empty Dst would degenerate into a
+// pure prepend. If you want to prepend without stripping, use SyntheticPrefix
+// instead — that's the supported mechanism for that case. Disallowing the
+// "empty Src + non-empty Dst" encoding keeps the mutual-exclusion check
+// against SyntheticPrefix meaningful.
 func (s BlockPrefixSubstitution) IsSet() bool {
-	return len(s.Src) > 0 || len(s.Dst) > 0
+	return len(s.Src) > 0
 }
 
 // Apply transforms a storage-space key into a destination-space key by
 // stripping the leading len(Src) bytes (which must equal Src) and prepending
 // Dst.
 func (s BlockPrefixSubstitution) Apply(storedKey []byte) []byte {
+	if len(s.Src) == 0 {
+		panic(errors.AssertionFailedf("BlockPrefixSubstitution.Apply called with empty Src; use SyntheticPrefix for pure prepend"))
+	}
 	if !bytes.HasPrefix(storedKey, s.Src) {
 		panic(errors.AssertionFailedf("stored key %q does not have expected source prefix %q", storedKey, s.Src))
 	}

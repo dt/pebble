@@ -339,7 +339,11 @@ func (b *PrefixBytes) SetAt(it *PrefixBytesIter, i int) {
 
 	// effectiveSharedPrefixLen excludes any leading bytes of the stored shared
 	// prefix that are being skipped because of a BlockPrefixSubstitution.
-	if invariants.Enabled && it.skipShared > uint32(b.sharedPrefixLen) {
+	// The guard below is unconditional (not gated by invariants.Enabled)
+	// because without it the subtraction below would underflow uint32 and
+	// produce a length that corrupts the heap via memmove. This check fires at
+	// most once per block-level iterator setup, not once per key.
+	if it.skipShared > uint32(b.sharedPrefixLen) {
 		panic(errors.AssertionFailedf("BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d",
 			errors.Safe(it.skipShared), errors.Safe(b.sharedPrefixLen)))
 	}
@@ -416,6 +420,12 @@ func (b *PrefixBytes) SetNext(it *PrefixBytesIter) {
 	bundlePrefixLen := rowSuffixStart - bundlePrefixStart
 	it.nextBundleOffsetIndex = it.offsetIndex + (1 << b.bundleShift)
 
+	// See SetAt: this guard is unconditional to prevent uint32 underflow and
+	// subsequent heap corruption via memmove in production builds.
+	if it.skipShared > uint32(b.sharedPrefixLen) {
+		panic(errors.AssertionFailedf("BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d",
+			errors.Safe(it.skipShared), errors.Safe(b.sharedPrefixLen)))
+	}
 	effectiveSharedPrefixLen := uint32(b.sharedPrefixLen) - it.skipShared
 	it.sharedAndBundlePrefixLen = it.prependLen + effectiveSharedPrefixLen + bundlePrefixLen
 	it.Buf = it.Buf[:it.sharedAndBundlePrefixLen+rowSuffixLen]

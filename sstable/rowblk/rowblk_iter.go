@@ -249,6 +249,12 @@ func (i *Iter) Init(
 	if numRestarts == 0 {
 		return base.CorruptionErrorf("pebble/table: invalid table (block has no restart points)")
 	}
+	// BlockPrefixSubstitution is implemented only for colblk data blocks. A
+	// pre-v5 (rowblk) sstable cannot apply the substitution; fail loudly here
+	// rather than silently emitting untranslated keys.
+	if transforms.BlockPrefixSubstitution.IsSet() {
+		return errors.AssertionFailedf("rowblk.Iter does not support BlockPrefixSubstitution")
+	}
 	i.transforms = transforms
 	i.synthSuffixBuf = i.synthSuffixBuf[:0]
 	i.split = split

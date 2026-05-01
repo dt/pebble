@@ -410,6 +410,117 @@ func TestPrefixBytesBlockPrefixSubstitution(t *testing.T) {
 	}
 }
 
+// TestPrefixBytesBlockPrefixSubstitutionEdgeCases exercises edge cases of
+// PrefixBytesIter under a BlockPrefixSubstitution that aren't covered by
+// TestPrefixBytesBlockPrefixSubstitution: an empty destination prefix (pure
+// stripping), a single-row block, and a block of duplicate keys (which
+// exercises PrefixBytesIter.SetNext's duplicate-key fast path).
+func TestPrefixBytesBlockPrefixSubstitutionEdgeCases(t *testing.T) {
+	type testCase struct {
+		name     string
+		src      []byte
+		dst      []byte
+		keys     [][]byte
+		expected [][]byte
+	}
+	cases := []testCase{
+		{
+			name: "empty-dst-pure-strip",
+			src:  []byte("/tenant/1/"),
+			dst:  nil,
+			keys: [][]byte{
+				[]byte("/tenant/1/aaa"),
+				[]byte("/tenant/1/aab"),
+				[]byte("/tenant/1/zzz"),
+			},
+			expected: [][]byte{
+				[]byte("aaa"),
+				[]byte("aab"),
+				[]byte("zzz"),
+			},
+		},
+		{
+			name: "single-row",
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/9/"),
+			keys: [][]byte{
+				[]byte("/tenant/1/only"),
+			},
+			expected: [][]byte{
+				[]byte("/tenant/9/only"),
+			},
+		},
+		{
+			name: "duplicate-keys",
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/9/"),
+			keys: [][]byte{
+				[]byte("/tenant/1/dup"),
+				[]byte("/tenant/1/dup"),
+				[]byte("/tenant/1/dup"),
+				[]byte("/tenant/1/dup"),
+				[]byte("/tenant/1/zzz"),
+			},
+			expected: [][]byte{
+				[]byte("/tenant/9/dup"),
+				[]byte("/tenant/9/dup"),
+				[]byte("/tenant/9/dup"),
+				[]byte("/tenant/9/dup"),
+				[]byte("/tenant/9/zzz"),
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, len(tc.keys), len(tc.expected))
+
+			var pbb PrefixBytesBuilder
+			pbb.Init(16)
+			for i, k := range tc.keys {
+				shared := 0
+				if i > 0 {
+					shared = crbytes.CommonPrefix(tc.keys[i-1], k)
+				}
+				pbb.Put(k, shared)
+			}
+			n := len(tc.keys)
+			size := pbb.Size(n, 0)
+			buf := make([]byte, size+1)
+			require.Equal(t, size, pbb.Finish(0, n, 0, buf))
+			pb, _ := DecodePrefixBytes(buf, 0, uint32(n))
+
+			require.True(t, bytes.HasPrefix(pb.SharedPrefix(), tc.src),
+				"stored shared prefix %q does not start with src %q", pb.SharedPrefix(), tc.src)
+
+			sub := blockiter.BlockPrefixSubstitution{Src: tc.src, Dst: tc.dst}
+			require.True(t, sub.IsSet())
+
+			maxLen := 0
+			for _, k := range tc.expected {
+				if len(k) > maxLen {
+					maxLen = len(k)
+				}
+			}
+			// Always include slack for the destination so the buffer can grow
+			// even if Dst is longer than Src.
+			subMaxLen := maxLen + len(tc.dst) + len(tc.src)
+
+			var pbi PrefixBytesIter
+			pbi.Init(subMaxLen, nil, sub)
+			for i := 0; i < n; i++ {
+				if i == 0 {
+					pb.SetAt(&pbi, i)
+				} else {
+					pb.SetNext(&pbi)
+				}
+				require.Equal(t, string(tc.expected[i]), string(pbi.Buf),
+					"row %d: got %q, want %q", i, pbi.Buf, tc.expected[i])
+			}
+		})
+	}
+}
+
 func BenchmarkPrefixBytes(b *testing.B) {
 	runBenchmark := func(b *testing.B, alphaLen int) {
 		seed := uint64(205295296)
