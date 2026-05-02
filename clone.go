@@ -116,11 +116,32 @@ func validateVirtualCloneInputs(
 		return errors.Newf("pebble: VirtualClone srcSpan start %q is not before end %q",
 			srcSpan.Start, srcSpan.End)
 	}
-	if cmp.Split == nil || cmp.Split(srcPrefix) != len(srcPrefix) {
-		return errors.New("pebble: VirtualClone srcPrefix must be a prefix key (Split(srcPrefix)==len(srcPrefix))")
+	if cmp.Split == nil {
+		return errors.New("pebble: VirtualClone requires a Comparer with a non-nil Split")
 	}
-	if cmp.Split(dstPrefix) != len(dstPrefix) {
-		return errors.New("pebble: VirtualClone dstPrefix must be a prefix key (Split(dstPrefix)==len(dstPrefix))")
+	// Correctness invariant for BlockPrefixSubstitution: substituting srcPrefix
+	// with dstPrefix on every key in a block must preserve the user-prefix /
+	// suffix boundary. For any key shaped as srcPrefix+tail, we need
+	// Split(srcPrefix+tail) and Split(dstPrefix+tail) to point at the same
+	// offset within tail. A sufficient (and the simplest) condition is that the
+	// Split position relative to the end of the prefix matches on both sides:
+	//   Split(srcPrefix) - len(srcPrefix) == Split(dstPrefix) - len(dstPrefix)
+	//
+	// The previous, stricter form required Split to land exactly at the end of
+	// the prefix (Split(prefix) == len(prefix)). That rejected real-world
+	// CockroachDB tenant prefixes, which carry a trailing sentinel byte that
+	// causes Split to position before the end. Such prefixes are still safe to
+	// substitute as long as srcPrefix and dstPrefix have matching trailing
+	// "suffix-like" tails. Do not strengthen this back without considering the
+	// CRDB tenant-prefix encoding.
+	srcSplitDelta := cmp.Split(srcPrefix) - len(srcPrefix)
+	dstSplitDelta := cmp.Split(dstPrefix) - len(dstPrefix)
+	if srcSplitDelta != dstSplitDelta {
+		return errors.Newf(
+			"pebble: VirtualClone srcPrefix and dstPrefix have inconsistent Split positions "+
+				"(Split(srcPrefix)-len(srcPrefix)=%d, Split(dstPrefix)-len(dstPrefix)=%d); "+
+				"substitution would shift the user-prefix/suffix boundary",
+			srcSplitDelta, dstSplitDelta)
 	}
 	if !bytes.HasPrefix(srcSpan.Start, srcPrefix) {
 		return errors.Newf(

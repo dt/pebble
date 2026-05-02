@@ -1542,3 +1542,213 @@ func TestVirtualClone_RangeKey_PointStraddler(t *testing.T) {
 		"[/tenant/4/ra,/tenant/4/rz),@5=rk-inside",
 	}, ranges)
 }
+
+// TestVirtualClone_PrefixSplitInvariant exercises the Split-position
+// validation in validateVirtualCloneInputs. The check must permit prefixes
+// where Split lands before the end of the prefix as long as the offset
+// (relative to the end of the prefix) matches between src and dst — this is
+// the case for CockroachDB tenant prefixes that carry a trailing sentinel
+// byte. The check must still reject prefixes whose Split positions diverge,
+// since substitution would shift the user-prefix/suffix boundary.
+func TestVirtualClone_PrefixSplitInvariant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	srcSpan := KeyRange{Start: []byte("/tenant/1/"), End: []byte("/tenant/2/")}
+
+	// sentinelComparer mimics the CockroachDB tenant-prefix encoding: the last
+	// byte of any non-empty key is treated as a sentinel and Split returns the
+	// position before it. For prefix-only arguments, this returns
+	// len(prefix)-1, so the delta vs len(prefix) is -1 on both src and dst.
+	sentinelSplit := func(k []byte) int {
+		if len(k) == 0 {
+			return 0
+		}
+		return len(k) - 1
+	}
+	sentinelComparer := &base.Comparer{
+		Compare:        base.DefaultComparer.Compare,
+		Equal:          base.DefaultComparer.Equal,
+		AbbreviatedKey: base.DefaultComparer.AbbreviatedKey,
+		Separator:      base.DefaultComparer.Separator,
+		Successor:      base.DefaultComparer.Successor,
+		FormatKey:      base.DefaultComparer.FormatKey,
+		Split:          sentinelSplit,
+		Name:           base.DefaultComparer.Name,
+	}
+
+	type tc struct {
+		name     string
+		cmp      *base.Comparer
+		span     KeyRange
+		src, dst []byte
+		// expectErrContains is the substring expected in the validation
+		// error; empty means the call should succeed.
+		expectErrContains string
+	}
+	cases := []tc{
+		{
+			// Bytewise prefixes through DefaultSplit: Split(prefix) == len(prefix)
+			// on both sides; delta == 0 on both. Must succeed.
+			name: "trivial-split",
+			cmp:  base.DefaultComparer,
+			span: srcSpan,
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/4/"),
+		},
+		{
+			// CRDB-tenant-prefix-style: Split lands one byte before end of
+			// prefix on both sides. Delta == -1 on both. Must succeed.
+			name: "matched-sentinel-split",
+			cmp:  sentinelComparer,
+			span: srcSpan,
+			src:  []byte("/tenant/1/"),
+			dst:  []byte("/tenant/4/"),
+		},
+		{
+			// Different-length prefixes whose sentinel-style Split positions
+			// still match in offset relative to the end. Delta == -1 on both.
+			name: "matched-sentinel-different-length",
+			cmp:  sentinelComparer,
+			span: KeyRange{Start: []byte("/abc/x"), End: []byte("/abc0")},
+			src:  []byte("/abc/"),
+			dst:  []byte("/zzzzz/"),
+		},
+		{
+			// Mismatched Split positions: substitution would shift the
+			// user-prefix / suffix boundary. Must be rejected.
+			name: "mismatched-split-positions",
+			cmp: &base.Comparer{
+				Compare:        base.DefaultComparer.Compare,
+				Equal:          base.DefaultComparer.Equal,
+				AbbreviatedKey: base.DefaultComparer.AbbreviatedKey,
+				Separator:      base.DefaultComparer.Separator,
+				Successor:      base.DefaultComparer.Successor,
+				FormatKey:      base.DefaultComparer.FormatKey,
+				// Split that returns the position of the last '@' (or len if
+				// none). The src prefix has a trailing '@', so Split lands
+				// before its end (delta -1). The dst prefix has no '@', so
+				// Split returns len (delta 0). The deltas differ, so
+				// substitution would shift the boundary.
+				Split: func(k []byte) int {
+					for i := len(k) - 1; i >= 0; i-- {
+						if k[i] == '@' {
+							return i
+						}
+					}
+					return len(k)
+				},
+				Name: base.DefaultComparer.Name,
+			},
+			span:              KeyRange{Start: []byte("/tenant/1/@"), End: []byte("/tenant/1/A")},
+			src:               []byte("/tenant/1/@"),
+			dst:               []byte("/tenant/4/"),
+			expectErrContains: "inconsistent Split positions",
+		},
+		{
+			// Nil Split must be rejected.
+			name: "nil-split",
+			cmp: &base.Comparer{
+				Compare:        base.DefaultComparer.Compare,
+				Equal:          base.DefaultComparer.Equal,
+				AbbreviatedKey: base.DefaultComparer.AbbreviatedKey,
+				Separator:      base.DefaultComparer.Separator,
+				Successor:      base.DefaultComparer.Successor,
+				FormatKey:      base.DefaultComparer.FormatKey,
+				Name:           base.DefaultComparer.Name,
+			},
+			span:              srcSpan,
+			src:               []byte("/tenant/1/"),
+			dst:               []byte("/tenant/4/"),
+			expectErrContains: "non-nil Split",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateVirtualCloneInputs(c.cmp, c.span, c.src, c.dst)
+			if c.expectErrContains == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			require.Contains(t, fmt.Sprint(err), c.expectErrContains)
+		})
+	}
+}
+
+// TestVirtualClone_SentinelPrefixEndToEnd exercises the success case the
+// Split-relaxation unblocks: a Comparer whose Split positions before the end
+// of the prefix on both src and dst, modeling the CockroachDB tenant-prefix
+// encoding's trailing sentinel. The full clone path (read, validate, write,
+// read-back) must succeed and the cloned data must be readable in dst space.
+func TestVirtualClone_SentinelPrefixEndToEnd(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Comparer that treats the last byte of every non-empty key as a sentinel
+	// suffix. For our prefixes "src1!" and "dst9!" the sentinel ('!') is
+	// outside the [a-z] suffix range used by data, so the user-portion
+	// boundary is well-defined. We use bytewise comparison so the data
+	// ordering is straightforward.
+	sentinelSplit := func(k []byte) int {
+		if len(k) == 0 {
+			return 0
+		}
+		// For our test data, the trailing sentinel is the byte immediately
+		// after the prefix; the rest of the key is the application suffix.
+		// We model this with: last byte is the prefix-terminator sentinel.
+		return len(k) - 1
+	}
+	cmp := &base.Comparer{
+		Compare:            base.DefaultComparer.Compare,
+		Equal:              base.DefaultComparer.Equal,
+		AbbreviatedKey:     base.DefaultComparer.AbbreviatedKey,
+		Separator:          base.DefaultComparer.Separator,
+		Successor:          base.DefaultComparer.Successor,
+		ImmediateSuccessor: base.DefaultComparer.ImmediateSuccessor,
+		FormatKey:          base.DefaultComparer.FormatKey,
+		Split:              sentinelSplit,
+		// Use a distinct Name so opening the DB doesn't collide with the
+		// default-named Comparer's persisted name on subsequent opens.
+		Name: "pebble.test.sentinel-split",
+	}
+
+	mem := vfs.NewMem()
+	opts := &Options{
+		Comparer:                    cmp,
+		FS:                          mem,
+		FormatMajorVersion:          FormatPrefixSubstitution,
+		DisableAutomaticCompactions: true,
+		L0CompactionThreshold:       100,
+		L0StopWritesThreshold:       100,
+	}
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	// srcPrefix = "/tenant/1/!"; the trailing '!' is the sentinel byte.
+	// dstPrefix = "/tenant/4/!"; same shape.
+	srcPrefix := []byte("/tenant/1/!")
+	dstPrefix := []byte("/tenant/4/!")
+	value := []byte("v")
+
+	srcKeys := []string{
+		"/tenant/1/!a",
+		"/tenant/1/!b",
+		"/tenant/1/!c",
+	}
+	setMany(t, d, srcKeys, value)
+	require.NoError(t, d.Flush())
+
+	// srcSpan covers exactly the in-prefix range. End is the prefix's
+	// immediate successor (one past the last sentinel byte).
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/1/\"")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Reads on dst-space keys should return the cloned values.
+	for _, k := range srcKeys {
+		dstKey := string(dstPrefix) + k[len(srcPrefix):]
+		require.Equal(t, value, mustGet(t, d, dstKey))
+	}
+	// And the source keys are still readable in src space.
+	for _, k := range srcKeys {
+		require.Equal(t, value, mustGet(t, d, k))
+	}
+}
