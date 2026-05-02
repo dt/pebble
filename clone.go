@@ -494,6 +494,7 @@ func (d *DB) buildFullyContainedVirtual(
 		TableNum:              d.mu.versions.getNextTableNum(),
 		SeqNums:               m.SeqNums,
 		LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+		BlobReferenceDepth:    m.BlobReferenceDepth,
 		BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
 			Src: append([]byte(nil), srcPrefix...),
 			Dst: append([]byte(nil), dstPrefix...),
@@ -702,6 +703,7 @@ func (d *DB) buildStraddlerEntries(
 			TableNum:              d.mu.versions.getNextTableNum(),
 			SeqNums:               m.SeqNums,
 			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+			BlobReferenceDepth:    m.BlobReferenceDepth,
 			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
 				Src: append([]byte(nil), srcPrefix...),
 				Dst: append([]byte(nil), dstPrefix...),
@@ -760,6 +762,7 @@ func (d *DB) buildStraddlerEntries(
 			TableNum:              d.mu.versions.getNextTableNum(),
 			SeqNums:               m.SeqNums,
 			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+			BlobReferenceDepth:    m.BlobReferenceDepth,
 			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
 				Src: append([]byte(nil), srcPrefix...),
 				Dst: append([]byte(nil), dstPrefix...),
