@@ -320,33 +320,41 @@ func (i *IndexIter) applyTransforms(key []byte) []byte {
 		// or after all dst-prefixed keys (if the storage key is > Src or its
 		// immediate successor). This lets bounds checks stop iteration
 		// cleanly without producing a garbled translation.
+		//
+		// Sentinels are appended with a trailing zero byte so that comparers
+		// that interpret the trailing byte as a suffix length (e.g.
+		// cockroachkvs.Compare uses key[len(key)-1] as the encoded suffix
+		// length) treat the sentinel as a valid zero-suffix key. Without the
+		// trailing zero, a sentinel like the bytes [0xfe 0x05] would have
+		// its last byte interpreted as a 5-byte suffix length, producing a
+		// negative slice index when Compare strips the suffix region. The
+		// trailing zero is bytewise-stable for sort order and is valid input
+		// for every Pebble comparer in tree.
 		if !bytes.HasPrefix(key, sub.Src) {
 			i.keyBuf = i.keyBuf[:0]
 			if bytes.Compare(key, sub.Src) < 0 {
-				// Pre-Src territory. Return a key that sorts before Dst so
-				// upper-bound checks aren't fooled into thinking the block
-				// is in-range. We synthesize the (unique) key consisting of
-				// Dst[0]-1 (or empty) — but since dst is non-empty we can
-				// just emit a key one byte shorter than Dst that sorts before.
-				// In practice the index iter is positioned forward so this
-				// case rarely matters; still, return Dst (which is the
-				// smallest key sharing prefix Dst). Lower-bound seek already
-				// handles this in SeekGE.
-				i.keyBuf = append(i.keyBuf, sub.Dst...)
+				// Pre-Src territory. Emit a sentinel that sorts before any
+				// non-empty dst-prefixed key. The empty key sorts before all
+				// non-empty keys for any reasonable comparer (and explicitly
+				// for cockroachkvs.Compare, which length-compares zero-length
+				// inputs). Lower-bound seek paths handle the pre-Src case
+				// directly in SeekGE; this projection is for SeparatorLT-
+				// style bounds comparisons reached via the iter forward
+				// path.
 				return i.keyBuf
 			}
 			// Post-Src territory. Synthesize a key strictly greater than any
-			// Dst-prefixed key by emitting Dst with the last byte
-			// incremented. Since Dst is non-empty, this is well-defined.
+			// dst-prefixed key by emitting Dst with the last byte
+			// incremented (wrapping 0xff with an appended sentinel) and
+			// then a trailing zero byte for cockroachkvs compatibility.
 			i.keyBuf = append(i.keyBuf, sub.Dst...)
-			// Increment the last byte; if it's 0xff, fall back to appending
-			// a sentinel byte.
 			n := len(i.keyBuf) - 1
 			if i.keyBuf[n] != 0xff {
 				i.keyBuf[n]++
 			} else {
 				i.keyBuf = append(i.keyBuf, 0xff)
 			}
+			i.keyBuf = append(i.keyBuf, 0x00)
 			return i.keyBuf
 		}
 		key = key[len(sub.Src):]
@@ -479,11 +487,27 @@ func (i *IndexIter) Last() bool {
 // range. In the forward direction we treat such separators as past-end
 // (returning false) to avoid loading blocks whose keys cannot be safely
 // translated to dst space.
+//
+// The exception is the LAST index entry. The colblk index writer emits the
+// last entry's separator as the SST's overall upper bound — Successor of the
+// largest key in that block — which for a key whose first byte is far below
+// 0xff can shrink to a single high byte that does NOT itself start with
+// sub.Src. The corresponding last data block IS in the substitution range,
+// though, so we must not treat the last entry as past-end on the basis of
+// its separator alone. For the last entry we instead consult the previous
+// separator (the upper bound of the prior in-range block); if even that is
+// past sub.Src then this last block is also out of range, otherwise the
+// last block is in range and we keep it.
 func (i *IndexIter) Next() bool {
 	i.row = min(i.n, i.row+1)
 	if i.row < i.n {
 		if sub := i.blockPrefixSubstitution; sub.IsSet() {
 			sep := i.d.separators.At(i.row)
+			isLast := i.row == i.n-1
+			if isLast && i.row > 0 {
+				// Use the prior separator instead of the last-entry sentinel.
+				sep = i.d.separators.At(i.row - 1)
+			}
 			if !bytes.HasPrefix(sep, sub.Src) && bytes.Compare(sep, sub.Src) > 0 {
 				// This separator (and all subsequent ones, since separators
 				// are sorted) lies past the substitution range. Treat as
@@ -500,8 +524,8 @@ func (i *IndexIter) Next() bool {
 // if the index block is exhausted in the reverse direction. A call to Prev
 // while already exhausted in the reverse direction is a no-op.
 //
-// Mirroring Next: with a BlockPrefixSubstitution, separators whose stored
-// bytes are < sub.Src refer to blocks that lie before the substitution
+// With a BlockPrefixSubstitution, separators whose stored bytes are < sub.Src
+// refer to blocks whose UPPER bound lies entirely before the substitution
 // range. We treat such separators as exhausted in the reverse direction.
 func (i *IndexIter) Prev() bool {
 	i.row = max(-1, i.row-1)
