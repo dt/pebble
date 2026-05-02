@@ -441,6 +441,119 @@ func TestVirtualClone_BothEndsStraddling(t *testing.T) {
 	}
 }
 
+// TestVirtualClone_BoundaryBlock_ValueBlockValues exercises the
+// boundary-block rewrite path on a source SST whose values are stored
+// out-of-line in value blocks. Prior to the fix, the boundary-rewrite
+// IterateDataBlock call did not provide a lazy-value resolver, so any
+// out-of-line value crashed with a nil-pointer dereference. CRDB worked
+// around this with the cluster setting
+// `storage.in_sstable_value_blocks.enabled=false`.
+//
+// The test arranges keys under a single prefix, each with multiple MVCC-style
+// `@N` suffix versions. Adjacent versions of the same prefix trigger
+// `IsLikelyMVCCGarbage`, which routes the second-and-subsequent values to a
+// value block. By spanning the source SST across `/tenant/0/`, `/tenant/1/`,
+// and `/tenant/2/` we force both a lower- and an upper-boundary block to be
+// rewritten, exercising the resolver path on both ends.
+func TestVirtualClone_BoundaryBlock_ValueBlockValues(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	// Use a small data BlockSize so each key+value@N pair forms its own
+	// boundary block; this guarantees the boundary blocks contain at least
+	// one value-block-resident value.
+	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+
+	// Build a value large enough that we can reliably distinguish it across
+	// versions. The actual value-block routing decision depends on
+	// IsLikelyMVCCGarbage (prefix-equal SETs), not on value size.
+	mkValue := func(tag string) []byte {
+		// 64 bytes ensures the value is non-trivial in size and easy to
+		// compare across the dst-space readback.
+		v := make([]byte, 64)
+		copy(v, tag)
+		return v
+	}
+
+	// Each base key gets two versions (@2 then @1, since testkeys orders
+	// larger-suffix-first within a prefix). Writing both as adjacent SETs
+	// causes the second of each pair to be stored in a value block.
+	type kv struct {
+		key string
+		val []byte
+	}
+	var pairs []kv
+	addPair := func(prefix, base string) {
+		// testkeys: larger suffix sorts smaller, so version 2 then version 1
+		// produces strictly-increasing keys for the writer.
+		pairs = append(pairs,
+			kv{key: fmt.Sprintf("%s%s@2", prefix, base), val: mkValue(prefix + base + "@2")},
+			kv{key: fmt.Sprintf("%s%s@1", prefix, base), val: mkValue(prefix + base + "@1")},
+		)
+	}
+	addPair("/tenant/0/", "k00")
+	for i := 0; i < 30; i++ {
+		addPair("/tenant/1/", fmt.Sprintf("k%03d", i))
+	}
+	addPair("/tenant/2/", "k99")
+
+	for _, p := range pairs {
+		require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+	}
+	require.NoError(t, d.Flush())
+
+	// Sanity: confirm at least one SST in the LSM advertises value blocks.
+	// Without value blocks present in the source, this test would not
+	// exercise the previously-crashing path.
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+	bounds := base.UserKeyBoundsEndExclusive(srcPrefix, []byte("/tenant/2/"))
+	var sawValueBlocks bool
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, bounds).All() {
+			require.NoError(t, d.fileCache.withReader(context.Background(),
+				block.NoReadEnv, m,
+				func(r *sstable.Reader, _ sstable.ReadEnv) error {
+					if r.Attributes.Has(sstable.AttributeValueBlocks) {
+						sawValueBlocks = true
+					}
+					return nil
+				}))
+		}
+	}
+	require.True(t, sawValueBlocks,
+		"test setup did not produce a source SST with value blocks; the "+
+			"boundary-block rewrite would not exercise out-of-line value "+
+			"resolution. Adjust the key layout to ensure value-block routing.")
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Verify every cloned key reads back the original value. This is the
+	// assertion that previously crashed: if any of the boundary-block in-span
+	// values lived in a value block, IterateDataBlock would NPE on its nil
+	// lazyValuer.
+	for _, p := range pairs {
+		if !strings.HasPrefix(p.key, string(srcPrefix)) {
+			continue
+		}
+		dstKey := string(dstPrefix) + p.key[len(srcPrefix):]
+		require.Equal(t, p.val, mustGet(t, d, dstKey),
+			"dst key %s did not read back the source value", dstKey)
+	}
+
+	// And the source-side keys must remain untouched.
+	for _, p := range pairs {
+		require.Equal(t, p.val, mustGet(t, d, p.key),
+			"source key %s changed after VirtualClone", p.key)
+	}
+}
+
 // TestVirtualClone_MixedInteriorAndStraddlers exercises a mix of fully-
 // contained SSTs (interior) and straddling SSTs at each end.
 func TestVirtualClone_MixedInteriorAndStraddlers(t *testing.T) {

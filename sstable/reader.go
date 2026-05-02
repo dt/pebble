@@ -1211,6 +1211,12 @@ func (r *Reader) ReadDataBlock(
 // (no transforms applied). The user-key slice is reused across calls; the
 // caller must copy it if retention beyond the call is required.
 //
+// Values stored out-of-line in the table's value blocks are transparently
+// resolved to their materialized bytes before fn is invoked. Blob-handle
+// values are not supported by this iteration path; if encountered they panic
+// (callers that need blob-handle support must materialize values via a richer
+// interface that supplies a blob fetcher).
+//
 // IterateDataBlock is intended for use by VirtualClone-style block-level
 // rewrites and validations. It is only supported on colblk-format tables.
 func (r *Reader) IterateDataBlock(
@@ -1225,10 +1231,13 @@ func (r *Reader) IterateDataBlock(
 	}
 	defer bufH.Release()
 
+	vc, closeVC := r.makeBlockValueConstructor()
+	defer closeVC()
+
 	var dec colblk.DataBlockDecoder
 	bd := dec.Init(r.keySchema, bufH.BlockData())
 	var iter colblk.DataBlockIter
-	iter.InitOnce(r.keySchema, r.Comparer, nil /* lazyValuer */, colblk.OptionalColumnConfig{})
+	iter.InitOnce(r.keySchema, r.Comparer, vc, colblk.OptionalColumnConfig{})
 	if err := iter.Init(&dec, bd, blockiter.NoTransforms, colblk.OptionalColumnConfig{}); err != nil {
 		return err
 	}
@@ -1243,6 +1252,97 @@ func (r *Reader) IterateDataBlock(
 		}
 	}
 	return nil
+}
+
+// makeBlockValueConstructor returns a block.GetInternalValueForPrefixAndValueHandler
+// suitable for the block-level helpers (IterateDataBlock and
+// FirstAndLastInternalKeyOfDataBlock) that read a single data block outside
+// the context of a full sstable iterator.
+//
+// If the table has no value blocks, the returned handler is non-nil but its
+// methods will panic if invoked; callers must rely on the data block iterator
+// only invoking the handler when it sees a value-handle prefix in the value
+// column, which a value-block-free table cannot produce.
+//
+// The returned cleanup function must be invoked when the handler is no
+// longer needed; it releases any value-block index and value-block buffers
+// that were lazily fetched.
+func (r *Reader) makeBlockValueConstructor() (
+	block.GetInternalValueForPrefixAndValueHandler,
+	func(),
+) {
+	if !r.Attributes.Has(AttributeValueBlocks) {
+		return blockValueConstructorNoValueBlocks{}, func() {}
+	}
+	vc := &blockValueConstructor{}
+	vc.vbReader = valblk.MakeReader(
+		(*readerValueBlockReader)(r),
+		MakeTrivialReaderProvider(r),
+		r.valueBIH,
+		nil, /* stats */
+		nil, /* catStats */
+	)
+	return vc, vc.vbReader.Close
+}
+
+// blockValueConstructor implements
+// block.GetInternalValueForPrefixAndValueHandler for the block-level reader
+// helpers. It resolves value-block handles via an embedded valblk.Reader and
+// rejects blob-file handles (these helpers do not currently provide a blob
+// fetcher).
+type blockValueConstructor struct {
+	vbReader valblk.Reader
+}
+
+var _ block.GetInternalValueForPrefixAndValueHandler = (*blockValueConstructor)(nil)
+
+// GetInternalValueForPrefixAndValueHandle implements
+// block.GetInternalValueForPrefixAndValueHandler.
+func (i *blockValueConstructor) GetInternalValueForPrefixAndValueHandle(
+	handle []byte,
+) base.InternalValue {
+	vp := block.ValuePrefix(handle[0])
+	if vp.IsValueBlockHandle() {
+		return i.vbReader.GetInternalValueForPrefixAndValueHandle(handle)
+	}
+	// Blob-handle resolution is not supported by the block-level reader
+	// helpers; the only in-tree callers (VirtualClone boundary classification
+	// and rewrite) do not provide a blob fetcher.
+	panic(errors.AssertionFailedf(
+		"sstable: block-level data-block iteration encountered a blob value handle "+
+			"(prefix=%x); blob-handle resolution is not supported by this iteration path",
+		errors.Safe(vp)))
+}
+
+// blockValueConstructorNoValueBlocks is the trivial handler installed when the
+// underlying table has no value blocks. Any invocation indicates a logic error
+// (the data block iterator should not produce a value-handle prefix when no
+// value blocks exist).
+type blockValueConstructorNoValueBlocks struct{}
+
+var _ block.GetInternalValueForPrefixAndValueHandler = blockValueConstructorNoValueBlocks{}
+
+// GetInternalValueForPrefixAndValueHandle implements
+// block.GetInternalValueForPrefixAndValueHandler.
+func (blockValueConstructorNoValueBlocks) GetInternalValueForPrefixAndValueHandle(
+	[]byte,
+) base.InternalValue {
+	panic(errors.AssertionFailedf(
+		"sstable: block-level data-block iteration encountered an out-of-line value " +
+			"in a table that does not advertise value blocks"))
+}
+
+// readerValueBlockReader adapts *Reader to valblk.IteratorBlockReader so that
+// the block-level helpers can construct a valblk.Reader for resolving
+// out-of-line values without an open sstable iterator. It mirrors the pattern
+// of trivialReaderProvider: a zero-allocation type-conversion wrapper.
+type readerValueBlockReader Reader
+
+var _ valblk.IteratorBlockReader = (*readerValueBlockReader)(nil)
+
+// ReadValueBlock implements valblk.IteratorBlockReader.
+func (r *readerValueBlockReader) ReadValueBlock(bh block.Handle) (block.BufferHandle, error) {
+	return (*Reader)(r).readValueBlock(context.TODO(), block.NoReadEnv, noReadHandle, bh)
 }
 
 // FirstAndLastInternalKeyOfDataBlock reads the data block at bh and returns
@@ -1262,10 +1362,12 @@ func (r *Reader) FirstAndLastInternalKeyOfDataBlock(
 		return base.InternalKey{}, base.InternalKey{}, err
 	}
 	defer bufH.Release()
+	vc, closeVC := r.makeBlockValueConstructor()
+	defer closeVC()
 	var dec colblk.DataBlockDecoder
 	bd := dec.Init(r.keySchema, bufH.BlockData())
 	var iter colblk.DataBlockIter
-	iter.InitOnce(r.keySchema, r.Comparer, nil /* lazyValuer */, colblk.OptionalColumnConfig{})
+	iter.InitOnce(r.keySchema, r.Comparer, vc, colblk.OptionalColumnConfig{})
 	if err := iter.Init(&dec, bd, blockiter.NoTransforms, colblk.OptionalColumnConfig{}); err != nil {
 		return base.InternalKey{}, base.InternalKey{}, err
 	}
