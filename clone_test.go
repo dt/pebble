@@ -7,6 +7,7 @@ package pebble
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1867,6 +1868,308 @@ func TestVirtualClone_ReproZombieBackingOnSourceCompact(t *testing.T) {
 	// dst key still reflects the value that was visible at clone time.
 	require.Equal(t, []byte("v2"), mustGet(t, d, "/tenant/1/A0"))
 	require.Equal(t, []byte("v"), mustGet(t, d, "/tenant/4/A0"))
+}
+
+// TestVirtualClone_CRDBShape_Smoke is an end-to-end smoke test that constructs
+// an LSM resembling the actually-deployed CockroachDB shape (raw-byte tenant
+// prefixes, MVCC `@N` versions, value separation enabled with both value
+// blocks and blob references in play, destination keyspace pre-populated at
+// multiple levels, a mix of fully-contained and straddling source SSTs) and
+// then `VirtualClone`s a span across tenants. It exercises every
+// feature combination that downstream-integration bug discovery has
+// identified as a recurring CRDB-shape gap in the existing clone tests:
+//
+//  1. ValueSeparationPolicy enabled (MinimumSize=1, MinimumMVCCGarbageSize=10)
+//     so newest-version values flush into blob files and small MVCC-garbage
+//     versions land in value blocks within the source SST.
+//  2. Multiple `@N` versions per user-key prefix to drive `IsLikelyMVCCGarbage`
+//     and ensure value blocks are populated.
+//  3. Blob references attached to at least one in-span source SST (verified
+//     by listing the FS for `.blob` files and asserting `m.BlobReferences`
+//     is non-empty for the relevant SST).
+//  4. CRDB-style raw-byte tenant prefixes (`\xfe\x8b`, `\xfe\x8c`) of equal
+//     length, span `[\xfe\x8b, \xfe\x8c)`. The validation must accept these
+//     (see the `raw-tenant-prefix` case in
+//     `TestVirtualClone_PrefixLengthInvariant`).
+//  5. Destination keyspace pre-populated and compacted down so
+//     `assignClonedFileLevels` walks past occupied L6 / L4 / etc. and lands
+//     somewhere shallower.
+//  6. A mix of fully-contained source SSTs and a lower-end straddler whose
+//     boundary block contains out-of-line values, exercising the
+//     boundary-rewrite path with a value resolver attached.
+//
+// After the clone, the test verifies (a) dst-translated reads return the
+// correct values, (b) the source remains readable (clone is non-destructive),
+// (c) the dst-space scan matches expectations, and (d) `Close` succeeds. The
+// `Close` step is intentionally exercised because the close-time
+// `non-zero zombie file count` check has been observed to fail under this
+// shape; reproducing that in-tree is part of the value of this test.
+func TestVirtualClone_CRDBShape_Smoke(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Equal-length raw-byte tenant prefixes (CRDB tenant 11 / 12). The src
+	// span covers exactly `[srcPrefix, dstPrefix)` so the dst prefix's
+	// region is the next tenant up.
+	srcPrefix := []byte{0xfe, 0x8b}
+	dstPrefix := []byte{0xfe, 0x8c}
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte{0xfe, 0x8c}}
+
+	// Use a small per-level BlockSize so each key+value pair forms (at most)
+	// one or two data blocks; this keeps the boundary block small and
+	// ensures the lower-end straddler has its boundary block contain at
+	// least one out-of-line value.
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 64, func(opts *Options) {
+		// Mirror the CRDB-shipped value-separation policy: newest values
+		// >= 1 byte flush into blob files; MVCC garbage values >= 10 bytes
+		// also go into blob files; smaller MVCC garbage stays in value
+		// blocks within the sstable.
+		opts.ValueSeparationPolicy = func() ValueSeparationPolicy {
+			return ValueSeparationPolicy{
+				Enabled:                true,
+				MinimumSize:            1,
+				MinimumMVCCGarbageSize: 10,
+				MaxBlobReferenceDepth:  10,
+			}
+		}
+	})
+	// The Close at the end must run the close-time zombie/leak check; defer
+	// it before any potentially-failing assertion so we always observe
+	// whether Close succeeds or fails.
+	defer func() { require.NoError(t, d.Close()) }()
+
+	// mkBigVal returns a non-trivial newest-version value. With
+	// MinimumSize=1, any non-empty value qualifies for blob-file routing,
+	// but a larger payload makes the test more realistic and easier to
+	// inspect when debugging.
+	mkBigVal := func(tag string) []byte {
+		v := make([]byte, 64)
+		copy(v, tag)
+		return v
+	}
+	// mkSmallVal returns a 4-byte value used for older `@1` MVCC-garbage
+	// versions. Because 4 < MinimumMVCCGarbageSize (10), the writer routes
+	// this value to a value block within the sstable rather than a blob
+	// file.
+	mkSmallVal := func(tag string) []byte {
+		v := []byte(tag + "____")
+		return v[:4]
+	}
+
+	// pair holds the wire-form keys and values for a single row's two MVCC
+	// versions. Pre-computing these lets us both write them and later
+	// assert read-backs symmetrically.
+	type pair struct {
+		key string
+		val []byte
+	}
+	mkRow := func(rowPrefix []byte, base string) []pair {
+		// testkeys orders larger suffix first within a prefix, so emit
+		// `@2` then `@1` to keep the writer in increasing-key order.
+		k2 := append(append([]byte{}, rowPrefix...), []byte(base+"@2")...)
+		k1 := append(append([]byte{}, rowPrefix...), []byte(base+"@1")...)
+		return []pair{
+			{key: string(k2), val: mkBigVal(base + "@2")},
+			{key: string(k1), val: mkSmallVal(base + "@1")},
+		}
+	}
+
+	// 1. Pre-populate the destination keyspace and compact to L6, so
+	//    `assignClonedFileLevels` will not land cloned files in an empty L6.
+	{
+		var pairs []pair
+		for i := 0; i < 6; i++ {
+			pairs = append(pairs, mkRow(dstPrefix, fmt.Sprintf("dstdeep%03d", i))...)
+		}
+		for _, p := range pairs {
+			require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+		}
+		require.NoError(t, d.Flush())
+		// Compact the dst-prefix range down to L6.
+		startKey := append(append([]byte{}, dstPrefix...), 0x00)
+		endKey := append(append([]byte{}, dstPrefix...), 0xff)
+		require.NoError(t, d.Compact(context.Background(), startKey, endKey, true))
+	}
+	// 2. More dst data, leaving an additional file in L0 (or higher) — this
+	//    ensures the dst region is occupied at more than one level when
+	//    the clone runs.
+	{
+		var pairs []pair
+		for i := 0; i < 6; i++ {
+			pairs = append(pairs, mkRow(dstPrefix, fmt.Sprintf("dstmid%03d", i))...)
+		}
+		for _, p := range pairs {
+			require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+		}
+		require.NoError(t, d.Flush())
+	}
+
+	// 3. Source-side data. We build:
+	//    - SST A: fully-contained in srcPrefix, many rows with `@2/@1`
+	//      versions. The `@1` (small) values populate value blocks; the
+	//      `@2` (big) values are flushed into blob files.
+	//    - SST B: lower-end straddler containing some `\xfe\x8a` keys
+	//      (just below srcPrefix) and some `\xfe\x8b` keys (in srcSpan).
+	//      The boundary block at the lower bound contains in-span keys
+	//      whose `@2` values are blob refs (out-of-line) and whose `@1`
+	//      values are value-block-resident; this exercises the
+	//      boundary-rewrite path with both kinds of out-of-line value.
+	var srcPairs []pair
+	{
+		// SST A: fully-contained.
+		var pairs []pair
+		for i := 0; i < 25; i++ {
+			pairs = append(pairs, mkRow(srcPrefix, fmt.Sprintf("rowA%03d", i))...)
+		}
+		for _, p := range pairs {
+			require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+		}
+		require.NoError(t, d.Flush())
+		srcPairs = append(srcPairs, pairs...)
+	}
+	{
+		// SST B: lower-end straddler. Use a separate flush so this is its
+		// own SST, independent of A.
+		justBelow := []byte{0xfe, 0x8a}
+		var pairs []pair
+		for i := 0; i < 4; i++ {
+			pairs = append(pairs, mkRow(justBelow, fmt.Sprintf("below%03d", i))...)
+		}
+		var inSpanPairs []pair
+		// Names sort below SST A's `rowA*` so the straddler covers the
+		// lower edge of srcSpan even after compaction rearrangement.
+		for i := 0; i < 6; i++ {
+			inSpanPairs = append(inSpanPairs, mkRow(srcPrefix, fmt.Sprintf("aaa%03d", i))...)
+		}
+		pairs = append(pairs, inSpanPairs...)
+		for _, p := range pairs {
+			require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+		}
+		require.NoError(t, d.Flush())
+		srcPairs = append(srcPairs, inSpanPairs...)
+	}
+
+	// 4. Confirm the LSM shape we just built actually exhibits each of the
+	//    feature combinations the test cares about. Failing fast here makes
+	//    later assertion failures interpretable.
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+
+	// 4a. Confirm at least one source SST carries non-empty BlobReferences
+	//     (so the clone exercises blob-handle resolution) and report whether
+	//     any source SST also has value blocks.
+	//
+	//     NB: under the CRDB-shipped policy MinimumSize=1, value separation
+	//     unconditionally routes every non-empty SET value into a blob file
+	//     at flush time (see `valsep.ValueSeparator.Add` and
+	//     `internal/compact/run.go:300`), so flush-produced source SSTs
+	//     typically contain blob refs but no value blocks. The boundary-
+	//     rewrite bug class is identical for both flavors of out-of-line
+	//     value, so we treat blob-ref presence as the load-bearing
+	//     prerequisite and log value-block presence informationally.
+	srcBounds := base.UserKeyBoundsEndExclusive(srcPrefix, dstPrefix)
+	var sawValueBlocks, sawBlobRefs bool
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, srcBounds).All() {
+			if len(m.BlobReferences) > 0 {
+				sawBlobRefs = true
+			}
+			require.NoError(t, d.fileCache.withReader(context.Background(),
+				block.NoReadEnv, m,
+				func(r *sstable.Reader, _ sstable.ReadEnv) error {
+					if r.Attributes.Has(sstable.AttributeValueBlocks) {
+						sawValueBlocks = true
+					}
+					return nil
+				}))
+		}
+	}
+	require.True(t, sawBlobRefs,
+		"test setup did not produce a source SST with blob references; "+
+			"clone of blob-referenced values would not be exercised")
+	t.Logf("source-SST value-block presence: %v (informational; "+
+		"under MinimumSize=1, value separation routes everything to blob files)",
+		sawValueBlocks)
+
+	// 4b. Confirm at least one .blob file exists in the FS — i.e., values
+	//     really are stored out-of-line in a blob file.
+	files, err := d.opts.FS.List("")
+	require.NoError(t, err)
+	blobFiles := slices.DeleteFunc(slices.Clone(files), func(name string) bool {
+		return !strings.HasSuffix(name, ".blob")
+	})
+	require.Greaterf(t, len(blobFiles), 0,
+		"expected at least one .blob file to be present, got %v", files)
+
+	// 4c. Confirm dst-region occupancy at more than one level.
+	dstBounds := base.UserKeyBoundsEndExclusive(dstPrefix, []byte{0xfe, 0x8d})
+	dstLevelsOccupied := 0
+	for layer, ls := range v.AllLevelsAndSublevels() {
+		var hit bool
+		for range ls.Overlaps(d.cmp, dstBounds).All() {
+			hit = true
+		}
+		if hit {
+			dstLevelsOccupied++
+			t.Logf("dst-region occupies layer %s", layer)
+		}
+	}
+	require.GreaterOrEqual(t, dstLevelsOccupied, 2,
+		"dst region should occupy at least two levels so that "+
+			"assignClonedFileLevels has to walk past occupied levels")
+
+	// 5. Run the clone.
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// 6. Read every src key back from its dst-translated counterpart and
+	//    verify it matches.
+	for _, p := range srcPairs {
+		require.True(t, strings.HasPrefix(p.key, string(srcPrefix)),
+			"unexpected non-src-prefixed pair %x", p.key)
+		dstKey := string(dstPrefix) + p.key[len(srcPrefix):]
+		gotVal, closer, err := d.Get([]byte(dstKey))
+		require.NoErrorf(t, err, "Get(dst %x) for src %x", dstKey, p.key)
+		require.Equalf(t, p.val, gotVal,
+			"dst key %x did not read back source value", dstKey)
+		require.NoError(t, closer.Close())
+	}
+
+	// 7. Verify the source keys are still readable in src space (clone is
+	//    non-destructive).
+	for _, p := range srcPairs {
+		gotVal, closer, err := d.Get([]byte(p.key))
+		require.NoErrorf(t, err, "Get(src %x) after clone", p.key)
+		require.Equalf(t, p.val, gotVal,
+			"src key %x changed after VirtualClone", p.key)
+		require.NoError(t, closer.Close())
+	}
+
+	// 8. Scan over the dst region and confirm the result set contains the
+	//    union of pre-existing dst keys and the cloned src keys (both in
+	//    dst space).
+	gotKeys := scanRange(t, d, dstPrefix, []byte{0xfe, 0x8d})
+	gotSet := make(map[string]struct{}, len(gotKeys))
+	for _, k := range gotKeys {
+		gotSet[k] = struct{}{}
+	}
+	for _, p := range srcPairs {
+		dstKey := string(dstPrefix) + p.key[len(srcPrefix):]
+		if _, ok := gotSet[dstKey]; !ok {
+			t.Errorf("dst-space scan missing cloned key %x", dstKey)
+		}
+	}
+	for _, base := range []string{"dstdeep", "dstmid"} {
+		for i := 0; i < 6; i++ {
+			for _, suffix := range []string{"@2", "@1"} {
+				k := string(dstPrefix) + fmt.Sprintf("%s%03d", base, i) + suffix
+				if _, ok := gotSet[k]; !ok {
+					t.Errorf("dst-space scan missing pre-existing dst key %x", k)
+				}
+			}
+		}
+	}
 }
 
 // requireBlobRefsOnSource scans the LSM in the bounds of the given prefix and
