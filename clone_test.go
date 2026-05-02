@@ -1822,6 +1822,53 @@ func TestVirtualClone_SentinelPrefixEndToEnd(t *testing.T) {
 	}
 }
 
+// TestVirtualClone_ReproZombieBackingOnSourceCompact reproduces the
+// physical-source-backing zombie bug: when a clone shares a *physical* source
+// SST's backing with new virtual SSTs, the source backing is registered in
+// virtualBackings via CreatedBackingTables, but the source physical SST
+// remains live with its own physical-table tracking on the same backing.
+// When the source is later compacted away, the physical-zombie code path in
+// getZombieTablesAndUpdateVirtualBackings adds the backing to zombieTables
+// even though the cloned virtual SSTs still reference it. Close then fatals
+// with "non-zero zombie file count".
+func TestVirtualClone_ReproZombieBackingOnSourceCompact(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+
+	srcKeys := []string{
+		"/tenant/1/A0", "/tenant/1/A1", "/tenant/1/A2",
+	}
+	setMany(t, d, srcKeys, []byte("v"))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Write a new version of one of the source keys, flush, and compact the
+	// source range. This forces a real rewrite of the source-side SST (not a
+	// level-only move): the source SST is deleted and a new one is created
+	// with merged contents. Without the stand-in fix, the source's backing
+	// is still in virtualBackings (added when the clone arranged to share
+	// it) AND is added to zombieTables by the compaction VE's physical-zombie
+	// path — close-time then asserts non-zero zombie file count. With the
+	// fix, the source is already a virtual stand-in so its backing is only
+	// tracked through virtualBackings and the compaction goes through the
+	// virtual-table path, keeping the accounting consistent.
+	require.NoError(t, d.Set([]byte("/tenant/1/A0"), []byte("v2"), nil))
+	require.NoError(t, d.Flush())
+	require.NoError(t, d.Compact(context.Background(),
+		[]byte("/tenant/1/A0"), []byte("/tenant/1/A2\x00"), true))
+
+	// Read-back: the original src key reflects the new write; the cloned
+	// dst key still reflects the value that was visible at clone time.
+	require.Equal(t, []byte("v2"), mustGet(t, d, "/tenant/1/A0"))
+	require.Equal(t, []byte("v"), mustGet(t, d, "/tenant/4/A0"))
+}
+
 // requireBlobRefsOnSource scans the LSM in the bounds of the given prefix and
 // asserts that at least one source-side SST advertises blob values
 // (AttributeBlobValues or non-empty BlobReferences). This is the precondition

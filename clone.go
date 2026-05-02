@@ -356,6 +356,13 @@ func (d *DB) virtualCloneAttempt(
 		}
 
 		ve := &manifest.VersionEdit{}
+		ve.DeletedTables = make(map[manifest.DeletedTableEntry]*manifest.TableMetadata)
+		// Per-source bookkeeping. We must visit each unique source SST at
+		// most once for the stand-in / backing-promotion bookkeeping below,
+		// even when it produces multiple cloned entries (e.g. a straddler
+		// with both a virtual in-span run and one or two boundary
+		// physicals).
+		seenSource := make(map[base.TableNum]struct{})
 		seenNewBacking := make(map[base.DiskFileNum]struct{})
 		for _, e := range entries {
 			meta := e.virtual
@@ -366,17 +373,70 @@ func (d *DB) virtualCloneAttempt(
 				Level: e.assignedLevel,
 				Meta:  meta,
 			})
-			if e.virtual != nil {
-				backingNum := e.source.TableBacking.DiskFileNum
-				if _, ok := d.mu.versions.latest.virtualBackings.Get(backingNum); ok {
-					continue
-				}
-				if _, ok := seenNewBacking[backingNum]; ok {
-					continue
-				}
-				seenNewBacking[backingNum] = struct{}{}
-				ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
+			if e.source == nil {
+				// Boundary-rewrite physical SSTs are self-contained: they
+				// have a fresh backing initialized by InitPhysicalBacking and
+				// no source-backing sharing to arrange.
+				continue
 			}
+			if _, ok := seenSource[e.source.TableNum]; ok {
+				continue
+			}
+			seenSource[e.source.TableNum] = struct{}{}
+
+			// Source-backing sharing. The cloned virtual SST(s) we emit
+			// AttachVirtualBacking(source.TableBacking), so the manifest must
+			// see this backing as a virtual backing (in latest.virtualBackings).
+			//
+			// If the source is itself virtual, its backing is already in the
+			// virtual-backings registry — nothing to do.
+			//
+			// If the source is physical, the backing is currently tracked
+			// only by the source's own TableMetadata. Promoting it to a
+			// virtual backing while the source physical SST remains live
+			// would double-track the backing: a future compaction that
+			// deletes the source would mark the backing as a physical zombie
+			// in getZombieTablesAndUpdateVirtualBackings (since the backing
+			// is in DeletedTables and not in that compaction's stillUsed
+			// set), but virtualBackings.AddAndRef has already taken a long-
+			// lived reference that no later VE can release until the cloned
+			// virtual is itself removed. The backing sits in zombieTables
+			// with a non-zero refcount forever, fataling Close with
+			// "non-zero zombie file count".
+			//
+			// To avoid that, replace the source physical SST with a virtual
+			// stand-in covering its identical bounds in this same VE. The
+			// stand-in references the same backing via AttachVirtualBacking
+			// (no data movement, no rewrite); from the LSM's perspective the
+			// source's data is unchanged in src space. The backing is now
+			// referenced only via virtualBackings, satisfying the manifest's
+			// "either physical or virtual, not both" invariant. This mirrors
+			// the excise.go pattern for shrinking a physical SST.
+			if !e.source.Virtual {
+				standIn, err := buildSourceStandIn(d.cmp, e.source, d.mu.versions.getNextTableNum(),
+					d.opts.Comparer.FormatKey, d.FormatMajorVersion())
+				if err != nil {
+					return versionUpdate{}, err
+				}
+				ve.DeletedTables[manifest.DeletedTableEntry{
+					Level:   e.sourceLevel,
+					FileNum: e.source.TableNum,
+				}] = e.source
+				ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
+					Level: e.sourceLevel,
+					Meta:  standIn,
+				})
+			}
+
+			backingNum := e.source.TableBacking.DiskFileNum
+			if _, ok := d.mu.versions.latest.virtualBackings.Get(backingNum); ok {
+				continue
+			}
+			if _, ok := seenNewBacking[backingNum]; ok {
+				continue
+			}
+			seenNewBacking[backingNum] = struct{}{}
+			ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
 		}
 
 		var metrics levelMetricsDelta
@@ -469,6 +529,50 @@ func (d *DB) flushMemtablesOverlappingClone(
 		return false, ctx.Err()
 	}
 	return true, nil
+}
+
+// buildSourceStandIn produces a virtual TableMetadata that covers the full
+// bounds of a physical source SST. It is used to replace the source physical
+// SST in the same VE that promotes the source's backing to a virtual backing
+// for the cloned virtual SST(s) to share. The stand-in carries no
+// substitution: it surfaces the source's data unchanged in src space.
+//
+// The stand-in shares the source's TableBacking via AttachVirtualBacking and
+// inherits the source's bounds, blob references, blob-reference depth, and
+// any synthetic prefix/suffix transforms. No data is read or written.
+func buildSourceStandIn(
+	cmp base.Compare,
+	src *manifest.TableMetadata,
+	tableNum base.TableNum,
+	formatKey base.FormatKey,
+	fmv FormatMajorVersion,
+) (*manifest.TableMetadata, error) {
+	standIn := &manifest.TableMetadata{
+		Virtual:                  true,
+		TableNum:                 tableNum,
+		SeqNums:                  src.SeqNums,
+		LargestSeqNumAbsolute:    src.LargestSeqNumAbsolute,
+		SyntheticPrefixAndSuffix: src.SyntheticPrefixAndSuffix,
+		BlobReferenceDepth:       src.BlobReferenceDepth,
+	}
+	if src.HasPointKeys {
+		standIn.ExtendPointKeyBounds(cmp, src.PointKeyBounds.Smallest(), src.PointKeyBounds.Largest())
+	}
+	if src.HasRangeKeys {
+		standIn.ExtendRangeKeyBounds(cmp, src.RangeKeyKinds, src.RangeKeyBounds.Smallest(), src.RangeKeyBounds.Largest())
+	}
+	standIn.AttachVirtualBacking(src.TableBacking)
+	standIn.Size = src.Size
+	if standIn.Size == 0 {
+		standIn.Size = 1
+	}
+	determineExcisedTableBlobReferences(src.BlobReferences, src.Size, standIn, fmv)
+	if err := standIn.Validate(cmp, formatKey); err != nil {
+		return nil, errors.Wrapf(err,
+			"pebble: VirtualClone produced invalid source stand-in for %s", src.TableNum)
+	}
+	standIn.ValidateVirtual(src)
+	return standIn, nil
 }
 
 // buildFullyContainedVirtual produces a virtual TableMetadata for a source
