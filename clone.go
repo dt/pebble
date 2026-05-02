@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 )
 
@@ -116,32 +117,31 @@ func validateVirtualCloneInputs(
 		return errors.Newf("pebble: VirtualClone srcSpan start %q is not before end %q",
 			srcSpan.Start, srcSpan.End)
 	}
-	if cmp.Split == nil {
-		return errors.New("pebble: VirtualClone requires a Comparer with a non-nil Split")
-	}
-	// Correctness invariant for BlockPrefixSubstitution: substituting srcPrefix
-	// with dstPrefix on every key in a block must preserve the user-prefix /
-	// suffix boundary. For any key shaped as srcPrefix+tail, we need
-	// Split(srcPrefix+tail) and Split(dstPrefix+tail) to point at the same
-	// offset within tail. A sufficient (and the simplest) condition is that the
-	// Split position relative to the end of the prefix matches on both sides:
-	//   Split(srcPrefix) - len(srcPrefix) == Split(dstPrefix) - len(dstPrefix)
+	// Correctness invariant for BlockPrefixSubstitution: srcPrefix is substituted
+	// for dstPrefix as a literal byte-range replacement at the start of every
+	// in-block key, so the byte at offset i in any translated key (for i >=
+	// len(dstPrefix)) corresponds to the byte at offset i + len(srcPrefix) -
+	// len(dstPrefix) in the original. Requiring equal-length prefixes makes that
+	// shift zero, so every byte offset (and therefore every Split result, for
+	// any tail-determined Comparer.Split) is preserved. This is the simplest
+	// sufficient condition and covers the v1 caller (CockroachDB tenant clone
+	// with same-length varint tenant IDs).
 	//
-	// The previous, stricter form required Split to land exactly at the end of
-	// the prefix (Split(prefix) == len(prefix)). That rejected real-world
-	// CockroachDB tenant prefixes, which carry a trailing sentinel byte that
-	// causes Split to position before the end. Such prefixes are still safe to
-	// substitute as long as srcPrefix and dstPrefix have matching trailing
-	// "suffix-like" tails. Do not strengthen this back without considering the
-	// CRDB tenant-prefix encoding.
-	srcSplitDelta := cmp.Split(srcPrefix) - len(srcPrefix)
-	dstSplitDelta := cmp.Split(dstPrefix) - len(dstPrefix)
-	if srcSplitDelta != dstSplitDelta {
+	// We deliberately do NOT call Comparer.Split on srcPrefix or dstPrefix here:
+	// Split is contractually defined on full encoded keys, and producing a
+	// well-defined result for an arbitrary byte prefix is not required. CRDB's
+	// Split, for example, reads a trailing length byte and returns nonsense for
+	// inputs that aren't full keys. Earlier revisions of this check did probe
+	// Split on the prefixes; that was both unsound (undefined behavior on
+	// non-keys) and an unhelpful proxy (it rejected raw tenant prefixes that
+	// are correct, while accepting "engine-encoded" prefixes that no real key
+	// in the source span actually starts with). Don't reintroduce a Split-based
+	// check here without first defining Split's contract on partial keys.
+	if len(srcPrefix) != len(dstPrefix) {
 		return errors.Newf(
-			"pebble: VirtualClone srcPrefix and dstPrefix have inconsistent Split positions "+
-				"(Split(srcPrefix)-len(srcPrefix)=%d, Split(dstPrefix)-len(dstPrefix)=%d); "+
-				"substitution would shift the user-prefix/suffix boundary",
-			srcSplitDelta, dstSplitDelta)
+			"pebble: VirtualClone srcPrefix and dstPrefix must have the same length "+
+				"(len(srcPrefix)=%d, len(dstPrefix)=%d)",
+			len(srcPrefix), len(dstPrefix))
 	}
 	if !bytes.HasPrefix(srcSpan.Start, srcPrefix) {
 		return errors.Newf(
@@ -221,6 +221,16 @@ func (d *DB) virtualCloneAttempt(
 
 	srcSpanBounds := srcSpan.UserKeyBounds()
 
+	// Shared blob value fetcher for the lifetime of this attempt. Used by
+	// boundary-block reads (and any other block-level helper) to materialize
+	// values whose handles point into blob files. Per-source TableBlobContexts
+	// constructed downstream wire this fetcher together with the source
+	// table's own BlobReferences.
+	var blobFetcher blob.ValueFetcher
+	blobFetcher.Init(&currentVersion.BlobFiles, d.fileCache,
+		block.ReadEnv{}, blob.SuggestedCachedReaders(currentVersion.MaxReadAmp()))
+	defer func() { _ = blobFetcher.Close() }()
+
 	// Track physical SSTs we wrote pre-VE. On any failure path (retry,
 	// terminal error) before the VE applies, we must remove them from the
 	// object provider to avoid orphan files. Mirrors ingest.go's
@@ -280,7 +290,7 @@ func (d *DB) virtualCloneAttempt(
 			// build a block-aligned virtual TableMetadata + 0-2 boundary
 			// physical SSTs.
 			straddlerEntries, written, err := d.buildStraddlerEntries(
-				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix, survey)
+				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix, survey, &blobFetcher)
 			if err != nil {
 				// Track any objects already written before propagating.
 				preVEObjects = append(preVEObjects, written...)
@@ -346,6 +356,13 @@ func (d *DB) virtualCloneAttempt(
 		}
 
 		ve := &manifest.VersionEdit{}
+		ve.DeletedTables = make(map[manifest.DeletedTableEntry]*manifest.TableMetadata)
+		// Per-source bookkeeping. We must visit each unique source SST at
+		// most once for the stand-in / backing-promotion bookkeeping below,
+		// even when it produces multiple cloned entries (e.g. a straddler
+		// with both a virtual in-span run and one or two boundary
+		// physicals).
+		seenSource := make(map[base.TableNum]struct{})
 		seenNewBacking := make(map[base.DiskFileNum]struct{})
 		for _, e := range entries {
 			meta := e.virtual
@@ -356,17 +373,70 @@ func (d *DB) virtualCloneAttempt(
 				Level: e.assignedLevel,
 				Meta:  meta,
 			})
-			if e.virtual != nil {
-				backingNum := e.source.TableBacking.DiskFileNum
-				if _, ok := d.mu.versions.latest.virtualBackings.Get(backingNum); ok {
-					continue
-				}
-				if _, ok := seenNewBacking[backingNum]; ok {
-					continue
-				}
-				seenNewBacking[backingNum] = struct{}{}
-				ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
+			if e.source == nil {
+				// Boundary-rewrite physical SSTs are self-contained: they
+				// have a fresh backing initialized by InitPhysicalBacking and
+				// no source-backing sharing to arrange.
+				continue
 			}
+			if _, ok := seenSource[e.source.TableNum]; ok {
+				continue
+			}
+			seenSource[e.source.TableNum] = struct{}{}
+
+			// Source-backing sharing. The cloned virtual SST(s) we emit
+			// AttachVirtualBacking(source.TableBacking), so the manifest must
+			// see this backing as a virtual backing (in latest.virtualBackings).
+			//
+			// If the source is itself virtual, its backing is already in the
+			// virtual-backings registry — nothing to do.
+			//
+			// If the source is physical, the backing is currently tracked
+			// only by the source's own TableMetadata. Promoting it to a
+			// virtual backing while the source physical SST remains live
+			// would double-track the backing: a future compaction that
+			// deletes the source would mark the backing as a physical zombie
+			// in getZombieTablesAndUpdateVirtualBackings (since the backing
+			// is in DeletedTables and not in that compaction's stillUsed
+			// set), but virtualBackings.AddAndRef has already taken a long-
+			// lived reference that no later VE can release until the cloned
+			// virtual is itself removed. The backing sits in zombieTables
+			// with a non-zero refcount forever, fataling Close with
+			// "non-zero zombie file count".
+			//
+			// To avoid that, replace the source physical SST with a virtual
+			// stand-in covering its identical bounds in this same VE. The
+			// stand-in references the same backing via AttachVirtualBacking
+			// (no data movement, no rewrite); from the LSM's perspective the
+			// source's data is unchanged in src space. The backing is now
+			// referenced only via virtualBackings, satisfying the manifest's
+			// "either physical or virtual, not both" invariant. This mirrors
+			// the excise.go pattern for shrinking a physical SST.
+			if !e.source.Virtual {
+				standIn, err := buildSourceStandIn(d.cmp, e.source, d.mu.versions.getNextTableNum(),
+					d.opts.Comparer.FormatKey, d.FormatMajorVersion())
+				if err != nil {
+					return versionUpdate{}, err
+				}
+				ve.DeletedTables[manifest.DeletedTableEntry{
+					Level:   e.sourceLevel,
+					FileNum: e.source.TableNum,
+				}] = e.source
+				ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
+					Level: e.sourceLevel,
+					Meta:  standIn,
+				})
+			}
+
+			backingNum := e.source.TableBacking.DiskFileNum
+			if _, ok := d.mu.versions.latest.virtualBackings.Get(backingNum); ok {
+				continue
+			}
+			if _, ok := seenNewBacking[backingNum]; ok {
+				continue
+			}
+			seenNewBacking[backingNum] = struct{}{}
+			ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
 		}
 
 		var metrics levelMetricsDelta
@@ -461,6 +531,47 @@ func (d *DB) flushMemtablesOverlappingClone(
 	return true, nil
 }
 
+// buildSourceStandIn produces a virtual TableMetadata that covers the full
+// bounds of a physical source SST. It is used to replace the source physical
+// SST in the same VE that promotes the source's backing to a virtual backing
+// for the cloned virtual SST(s) to share. The stand-in carries no
+// substitution: it surfaces the source's data unchanged in src space.
+//
+// The stand-in shares the source's TableBacking via AttachVirtualBacking and
+// inherits the source's bounds, blob references, blob-reference depth, and
+// any synthetic prefix/suffix transforms. No data is read or written.
+func buildSourceStandIn(
+	cmp base.Compare, src *manifest.TableMetadata, tableNum base.TableNum,
+	formatKey base.FormatKey, fmv FormatMajorVersion,
+) (*manifest.TableMetadata, error) {
+	standIn := &manifest.TableMetadata{
+		Virtual:                  true,
+		TableNum:                 tableNum,
+		SeqNums:                  src.SeqNums,
+		LargestSeqNumAbsolute:    src.LargestSeqNumAbsolute,
+		SyntheticPrefixAndSuffix: src.SyntheticPrefixAndSuffix,
+		BlobReferenceDepth:       src.BlobReferenceDepth,
+	}
+	if src.HasPointKeys {
+		standIn.ExtendPointKeyBounds(cmp, src.PointKeyBounds.Smallest(), src.PointKeyBounds.Largest())
+	}
+	if src.HasRangeKeys {
+		standIn.ExtendRangeKeyBounds(cmp, src.RangeKeyKinds, src.RangeKeyBounds.Smallest(), src.RangeKeyBounds.Largest())
+	}
+	standIn.AttachVirtualBacking(src.TableBacking)
+	standIn.Size = src.Size
+	if standIn.Size == 0 {
+		standIn.Size = 1
+	}
+	determineExcisedTableBlobReferences(src.BlobReferences, src.Size, standIn, fmv)
+	if err := standIn.Validate(cmp, formatKey); err != nil {
+		return nil, errors.Wrapf(err,
+			"pebble: VirtualClone produced invalid source stand-in for %s", src.TableNum)
+	}
+	standIn.ValidateVirtual(src)
+	return standIn, nil
+}
+
 // buildFullyContainedVirtual produces a virtual TableMetadata for a source
 // table whose bounds lie entirely within srcSpan.
 func (d *DB) buildFullyContainedVirtual(
@@ -495,6 +606,7 @@ func (d *DB) buildFullyContainedVirtual(
 		TableNum:              d.mu.versions.getNextTableNum(),
 		SeqNums:               m.SeqNums,
 		LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+		BlobReferenceDepth:    m.BlobReferenceDepth,
 		BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
 			Src: append([]byte(nil), srcPrefix...),
 			Dst: append([]byte(nil), dstPrefix...),
@@ -540,10 +652,19 @@ func (d *DB) buildStraddlerEntries(
 	srcSpanBounds base.UserKeyBounds,
 	srcPrefix, dstPrefix []byte,
 	survey fragmentSurvey,
+	blobFetcher *blob.ValueFetcher,
 ) (entries []clonePlanEntry, written []base.DiskFileNum, _ error) {
 	if !m.HasPointKeys {
 		return nil, nil, errors.AssertionFailedf(
 			"pebble: VirtualClone source table %s has no point keys", m.TableNum)
+	}
+
+	// Per-source-table blob context. The fetcher is shared across all source
+	// SSTs in this attempt; the References are this source SST's own blob
+	// references (used to map a row's reference index to a blob file ID).
+	blobContext := sstable.TableBlobContext{
+		ValueFetcher: blobFetcher,
+		References:   &m.BlobReferences,
 	}
 
 	var blocks []blockInfo
@@ -667,7 +788,7 @@ func (d *DB) buildStraddlerEntries(
 	if firstInSpan >= 0 {
 		// Per-block precondition validation: every in-span block's stored
 		// shared prefix must start with srcPrefix.
-		if err := d.validateInSpanBlocks(ctx, m, blocks[firstInSpan:lastInSpan+1], srcPrefix); err != nil {
+		if err := d.validateInSpanBlocks(ctx, m, blocks[firstInSpan:lastInSpan+1], srcPrefix, blobContext); err != nil {
 			return nil, nil, err
 		}
 
@@ -690,7 +811,7 @@ func (d *DB) buildStraddlerEntries(
 		// firstKeyOf(blocks[firstInSpan]) and largest =
 		// lastKeyOf(blocks[lastInSpan]). validateInSpanBlocks already opens
 		// these blocks; we extract while we're there.
-		firstIK, lastIK, err := d.firstAndLastKeyOfRun(ctx, m, blocks[firstInSpan], blocks[lastInSpan])
+		firstIK, lastIK, err := d.firstAndLastKeyOfRun(ctx, m, blocks[firstInSpan], blocks[lastInSpan], blobContext)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -703,6 +824,7 @@ func (d *DB) buildStraddlerEntries(
 			TableNum:              d.mu.versions.getNextTableNum(),
 			SeqNums:               m.SeqNums,
 			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+			BlobReferenceDepth:    m.BlobReferenceDepth,
 			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
 				Src: append([]byte(nil), srcPrefix...),
 				Dst: append([]byte(nil), dstPrefix...),
@@ -761,6 +883,7 @@ func (d *DB) buildStraddlerEntries(
 			TableNum:              d.mu.versions.getNextTableNum(),
 			SeqNums:               m.SeqNums,
 			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+			BlobReferenceDepth:    m.BlobReferenceDepth,
 			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
 				Src: append([]byte(nil), srcPrefix...),
 				Dst: append([]byte(nil), dstPrefix...),
@@ -804,7 +927,7 @@ func (d *DB) buildStraddlerEntries(
 		}
 		physical, fileNum, err := d.rewriteBoundaryBlock(
 			ctx, m, blocks[idx].handle.Handle, srcSpan, srcSpanBounds,
-			srcPrefix, dstPrefix, level)
+			srcPrefix, dstPrefix, level, blobContext)
 		if err != nil {
 			return err
 		}
@@ -990,6 +1113,7 @@ func (d *DB) surveyAndValidateFragments(
 // shorter than srcPrefix.
 func (d *DB) validateInSpanBlocks(
 	ctx context.Context, m *manifest.TableMetadata, blocks []blockInfo, srcPrefix []byte,
+	blobContext sstable.TableBlobContext,
 ) error {
 	if len(blocks) == 0 {
 		return nil
@@ -997,7 +1121,7 @@ func (d *DB) validateInSpanBlocks(
 	return d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
 			for _, b := range blocks {
-				first, last, err := r.FirstAndLastUserKeyOfDataBlock(ctx, b.handle.Handle)
+				first, last, err := r.FirstAndLastUserKeyOfDataBlock(ctx, b.handle.Handle, blobContext)
 				if err != nil {
 					return errors.Wrapf(err,
 						"pebble: VirtualClone failed reading data block of source %s", m.TableNum)
@@ -1016,10 +1140,11 @@ func (d *DB) validateInSpanBlocks(
 // last InternalKey of lastBlock, in storage-prefix space.
 func (d *DB) firstAndLastKeyOfRun(
 	ctx context.Context, m *manifest.TableMetadata, firstBlock, lastBlock blockInfo,
+	blobContext sstable.TableBlobContext,
 ) (first, last base.InternalKey, _ error) {
 	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
-			f, l, err := r.FirstAndLastInternalKeyOfDataBlock(ctx, firstBlock.handle.Handle)
+			f, l, err := r.FirstAndLastInternalKeyOfDataBlock(ctx, firstBlock.handle.Handle, blobContext)
 			if err != nil {
 				return err
 			}
@@ -1028,7 +1153,7 @@ func (d *DB) firstAndLastKeyOfRun(
 				last = l
 				return nil
 			}
-			_, l, err = r.FirstAndLastInternalKeyOfDataBlock(ctx, lastBlock.handle.Handle)
+			_, l, err = r.FirstAndLastInternalKeyOfDataBlock(ctx, lastBlock.handle.Handle, blobContext)
 			if err != nil {
 				return err
 			}
@@ -1053,10 +1178,16 @@ func (d *DB) rewriteBoundaryBlock(
 	srcSpanBounds base.UserKeyBounds,
 	srcPrefix, dstPrefix []byte,
 	level int,
+	blobContext sstable.TableBlobContext,
 ) (*manifest.TableMetadata, base.DiskFileNum, error) {
 	cmp := d.cmp
 
-	// Collect (translatedKey, value) pairs for in-span keys.
+	// Collect (translatedKey, value) pairs for in-span keys. Values from
+	// out-of-line storage (value blocks or blob files) are materialized inline
+	// into the new physical SST: blobContext supplies the blob fetcher and
+	// the source SST's BlobReferences mapping. The new boundary SST has no
+	// blob references of its own; the source blob file's refcount is
+	// unaffected (the source SST keeps its reference).
 	type kvPair struct {
 		key   base.InternalKey
 		value []byte
@@ -1064,7 +1195,7 @@ func (d *DB) rewriteBoundaryBlock(
 	var pairs []kvPair
 	if err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
-			return r.IterateDataBlock(ctx, bh, func(k base.InternalKey, v []byte) error {
+			return r.IterateDataBlock(ctx, bh, blobContext, func(k base.InternalKey, v []byte) error {
 				if !srcSpanBounds.ContainsInternalKey(cmp, k) {
 					return nil
 				}
