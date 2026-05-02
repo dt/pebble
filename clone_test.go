@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/testkeys"
 	"github.com/cockroachdb/pebble/objstorage/objstorageprovider"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/block"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
@@ -34,6 +35,52 @@ func openCloneTestDB(t *testing.T, fmv FormatMajorVersion) *DB {
 func openCloneTestDBWithBlockSize(t *testing.T, fmv FormatMajorVersion, blockSize int) *DB {
 	t.Helper()
 	return openCloneTestDBWithOpts(t, fmv, blockSize, nil)
+}
+
+// openCloneTestDBTwoLevel opens a DB tuned to force two-level indexes for any
+// non-trivial flushed SST: data BlockSize and IndexBlockSize are both small,
+// so even a modest number of keys spills over the index-block threshold and
+// triggers a top-level / second-level index split.
+func openCloneTestDBTwoLevel(t *testing.T, fmv FormatMajorVersion) *DB {
+	t.Helper()
+	return openCloneTestDBWithOpts(t, fmv, 0, func(opts *Options) {
+		for i := range opts.Levels {
+			opts.Levels[i].BlockSize = 64
+			opts.Levels[i].IndexBlockSize = 64
+			opts.Levels[i].BlockSizeThreshold = 50
+		}
+	})
+}
+
+// requireTwoLevelIndex checks that every SST in the LSM that has any keys with
+// the given prefix uses a two-level index. This guards the two-level test
+// matrix against regressions where the writer no longer triggers two-level
+// indexes for the chosen tuning.
+func requireTwoLevelIndex(t *testing.T, d *DB, prefix []byte) {
+	t.Helper()
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+
+	bounds := base.UserKeyBoundsEndExclusive(prefix, append(append([]byte(nil), prefix...), 0xff))
+	var checked int
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, bounds).All() {
+			checked++
+			err := d.fileCache.withReader(context.Background(),
+				block.NoReadEnv, m,
+				func(r *sstable.Reader, _ sstable.ReadEnv) error {
+					require.True(t, r.Attributes.Has(sstable.AttributeTwoLevelIndex),
+						"expected SST %s to use a two-level index; attributes=%s",
+						m.TableNum, r.Attributes)
+					return nil
+				})
+			require.NoError(t, err)
+		}
+	}
+	require.Greater(t, checked, 0, "no SSTs intersected prefix %q", prefix)
 }
 
 // openCloneTestDBWithOpts is the most general clone-test DB opener. The optional
@@ -1011,4 +1058,206 @@ func TestVirtualClone_OrphanCleanupOnRetry(t *testing.T) {
 	// retry+cleanup machinery in clone.go).
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Equal(t, 30, len(got))
+}
+
+// TestVirtualClone_TwoLevelIndex_FullyContained verifies that cloning a
+// fully-contained source SST that uses a two-level index works end-to-end.
+// The fully-contained path doesn't actually walk per-data-block index
+// structure (it reuses the SST's bounds wholesale), so this is a smoke test
+// that the per-attempt format/two-level checks don't over-reject.
+func TestVirtualClone_TwoLevelIndex_FullyContained(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	// Many keys, all in srcPrefix range, to force a two-level index in the
+	// flushed SST. With BlockSize=64 and 24-byte values we get ~1-2 KVs per
+	// data block; with IndexBlockSize=64 the index spills to two-level
+	// quickly.
+	var keys []string
+	for i := 0; i < 200; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%05d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	// Confirm the test fixture actually produced a two-level index; otherwise
+	// the test isn't exercising what its name claims.
+	requireTwoLevelIndex(t, d, srcPrefix)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Len(t, got, 200)
+	for i, k := range got {
+		require.Equal(t, fmt.Sprintf("/tenant/4/k%05d", i), k)
+	}
+}
+
+// TestVirtualClone_TwoLevelIndex_LowerStraddler exercises the new boundary-
+// classification logic over a two-level index when the source SST straddles
+// only the lower bound of srcSpan.
+func TestVirtualClone_TwoLevelIndex_LowerStraddler(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	var keys []string
+	// Out-of-span keys at /tenant/0/ to introduce the lower straddle.
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/0/k%05d", i))
+	}
+	for i := 0; i < 200; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%05d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	// Confirm the SST uses a two-level index (the requireTwoLevelIndex helper
+	// only checks tables overlapping srcPrefix, but the merged SST contains
+	// both /tenant/0/ and /tenant/1/ keys so it overlaps).
+	requireTwoLevelIndex(t, d, srcPrefix)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Len(t, got, 200)
+	for i, k := range got {
+		require.Equal(t, fmt.Sprintf("/tenant/4/k%05d", i), k)
+	}
+	// Source out-of-span keys remain readable in src space.
+	for i := 0; i < 5; i++ {
+		require.Equal(t, value, mustGet(t, d, fmt.Sprintf("/tenant/0/k%05d", i)))
+	}
+}
+
+// TestVirtualClone_TwoLevelIndex_UpperStraddler is the symmetric upper-end
+// straddler case for two-level indexes.
+func TestVirtualClone_TwoLevelIndex_UpperStraddler(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	var keys []string
+	for i := 0; i < 200; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%05d", i))
+	}
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/2/k%05d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	requireTwoLevelIndex(t, d, srcPrefix)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Len(t, got, 200)
+	for i, k := range got {
+		require.Equal(t, fmt.Sprintf("/tenant/4/k%05d", i), k)
+	}
+}
+
+// TestVirtualClone_TwoLevelIndex_BothEnds exercises a srcSpan strictly inside
+// the SST's range with both ends straddling, against a two-level index. Both
+// boundary blocks must be rewritten.
+func TestVirtualClone_TwoLevelIndex_BothEnds(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	var keys []string
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/0/k%05d", i))
+	}
+	for i := 0; i < 200; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%05d", i))
+	}
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/2/k%05d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	requireTwoLevelIndex(t, d, srcPrefix)
+
+	// srcSpan strictly inside /tenant/1/.
+	srcSpan := KeyRange{Start: []byte("/tenant/1/k00010"), End: []byte("/tenant/1/k00150")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Len(t, got, 140)
+	for i, k := range got {
+		require.Equal(t, fmt.Sprintf("/tenant/4/k%05d", i+10), k)
+	}
+}
+
+// TestVirtualClone_TwoLevelIndex_RunCrossesSecondLevelBoundary is the case
+// that most directly exercises the new walking logic: the contiguous run of
+// in-span data blocks crosses one or more second-level index block
+// boundaries. The boundary-classification code must visit data blocks across
+// every second-level partition and not stop at a second-level boundary.
+func TestVirtualClone_TwoLevelIndex_RunCrossesSecondLevelBoundary(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	// Include a small out-of-span tail so the SST straddles the upper bound,
+	// which forces buildStraddlerEntries (the path with the two-level walk)
+	// to run instead of the fully-contained shortcut. The in-span run is
+	// long enough that the second-level index spills across multiple blocks
+	// (with IndexBlockSize=64 and ~1-2 data-block index entries per second-
+	// level block, 600 data blocks => many second-level partitions).
+	var keys []string
+	for i := 0; i < 600; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%05d", i))
+	}
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/2/k%05d", i))
+	}
+	setMany(t, d, keys, value)
+	require.NoError(t, d.Flush())
+
+	requireTwoLevelIndex(t, d, srcPrefix)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Len(t, got, 600)
+	for i, k := range got {
+		require.Equal(t, fmt.Sprintf("/tenant/4/k%05d", i), k)
+	}
+
+	// Spot-check the boundaries (first, last, and middle) via point Get to
+	// exercise the read path that goes through the substituted two-level
+	// index for fully-contained probe targets.
+	for _, i := range []int{0, 1, 299, 300, 599} {
+		require.Equal(t, value,
+			mustGet(t, d, fmt.Sprintf("/tenant/4/k%05d", i)))
+	}
 }

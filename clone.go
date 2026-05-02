@@ -25,7 +25,6 @@ import (
 //   - A source sstable that uses the row-based block format intersects
 //     srcSpan.
 //   - A source sstable that contains range keys intersects srcSpan.
-//   - A straddling source sstable uses a two-level index (TODO: support).
 //   - A straddling source sstable's in-span data blocks have a stored
 //     block-shared prefix shorter than srcPrefix.
 //   - All levels are saturated for a cloned file (extreme dst-conflict).
@@ -58,7 +57,6 @@ const virtualCloneMaxRetries = 5
 // Returns ErrUnsupportedClone (with details) for v1 unsupported cases:
 //   - rowblk-format SSTs intersecting srcSpan
 //   - any source SST containing range keys
-//   - a straddling source SST that uses a two-level index
 //   - a straddling source SST whose in-span data blocks have a stored
 //     shared prefix shorter than srcPrefix
 //   - destination region is so saturated no level can host a cloned file
@@ -514,8 +512,12 @@ func (d *DB) buildStraddlerEntries(
 	var blocks []blockInfo
 
 	var isRowblk bool
-	var twoLevel bool
 
+	// Note: WalkDataBlocks transparently handles both single-level and
+	// two-level index layouts (top-level -> second-level -> data block).
+	// The boundary classification below operates on the resulting flat list
+	// of (separator, handle) pairs and is independent of index depth, as is
+	// the per-block precondition validation and boundary-block rewrite.
 	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
 			format, err := r.TableFormat()
@@ -524,11 +526,6 @@ func (d *DB) buildStraddlerEntries(
 			}
 			if !format.BlockColumnar() {
 				isRowblk = true
-				return nil
-			}
-			// TODO(clone): support two-level indexes. For now, defer.
-			if r.Attributes.Has(sstable.AttributeTwoLevelIndex) {
-				twoLevel = true
 				return nil
 			}
 			return r.WalkDataBlocks(ctx, func(e sstable.DataBlockEntry) error {
@@ -546,11 +543,6 @@ func (d *DB) buildStraddlerEntries(
 	if isRowblk {
 		return nil, nil, errors.Wrapf(ErrUnsupportedClone,
 			"source table %s at L%d uses the row-based block format", m.TableNum, level)
-	}
-	if twoLevel {
-		return nil, nil, errors.Wrapf(ErrUnsupportedClone,
-			"source table %s at L%d is a straddler using a two-level index (TODO: supported in a follow-up)",
-			m.TableNum, level)
 	}
 	if len(blocks) == 0 {
 		return nil, nil, errors.AssertionFailedf(
