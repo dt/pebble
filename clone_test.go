@@ -1821,3 +1821,326 @@ func TestVirtualClone_SentinelPrefixEndToEnd(t *testing.T) {
 		require.Equal(t, value, mustGet(t, d, k))
 	}
 }
+
+// requireBlobRefsOnSource scans the LSM in the bounds of the given prefix and
+// asserts that at least one source-side SST advertises blob values
+// (AttributeBlobValues or non-empty BlobReferences). This is the precondition
+// for the boundary-block blob-handle tests: without a source SST that has
+// blob references, the boundary-block rewrite would not exercise the blob-
+// handle resolver path.
+func requireBlobRefsOnSource(t *testing.T, d *DB, prefix []byte) {
+	t.Helper()
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+	bounds := base.UserKeyBoundsEndExclusive(prefix, append(append([]byte(nil), prefix...), 0xff))
+	var sawBlob bool
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, bounds).All() {
+			if len(m.BlobReferences) > 0 {
+				sawBlob = true
+			}
+			require.NoError(t, d.fileCache.withReader(context.Background(),
+				block.NoReadEnv, m,
+				func(r *sstable.Reader, _ sstable.ReadEnv) error {
+					if r.Attributes.Has(sstable.AttributeBlobValues) {
+						sawBlob = true
+					}
+					return nil
+				}))
+		}
+	}
+	require.True(t, sawBlob,
+		"test setup did not produce a source SST with blob references; the "+
+			"boundary-block rewrite would not exercise blob-handle resolution. "+
+			"Check ValueSeparationPolicy + value sizes.")
+}
+
+// requireNoBlobRefsInDst walks all SSTs intersecting dstPrefix and asserts
+// that any *physical* (non-virtual) SST has an empty BlobReferences slice.
+// VirtualClone's boundary-rewrite path materializes blob-handle values inline
+// into the new physical boundary SST, so the new physical SST must not carry
+// any blob references of its own. (Virtual SSTs cloned from the source still
+// share the source's BlobReferences via the underlying physical backing; this
+// helper does not inspect those.)
+func requireNoBlobRefsInDst(t *testing.T, d *DB, dstPrefix []byte) {
+	t.Helper()
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+	bounds := base.UserKeyBoundsEndExclusive(dstPrefix,
+		append(append([]byte(nil), dstPrefix...), 0xff))
+	var checkedPhysical int
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, bounds).All() {
+			if m.Virtual {
+				continue
+			}
+			checkedPhysical++
+			require.Empty(t, m.BlobReferences,
+				"physical dst SST %s unexpectedly carries blob references; "+
+					"boundary-rewrite must materialize values inline", m.TableNum)
+		}
+	}
+	require.Greater(t, checkedPhysical, 0,
+		"expected at least one physical SST in dst space (rewritten boundary block)")
+}
+
+// TestVirtualClone_BoundaryBlock_BlobHandleValues exercises the boundary-block
+// rewrite path on a source SST whose values are stored out-of-line in an
+// external blob file. Prior to threading a TableBlobContext through
+// IterateDataBlock, the boundary-rewrite call had no resolver and panicked on
+// the first blob-handle row. Both the lower- and upper-boundary blocks must
+// be exercised; we arrange this by writing /tenant/0/, /tenant/1/, and
+// /tenant/2/ keys into a single SST so it straddles both ends of srcSpan.
+func TestVirtualClone_BoundaryBlock_BlobHandleValues(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Small data BlockSize so each row tends to land in its own block; this
+	// guarantees the lo- and hi-boundary blocks each contain at least one
+	// in-span key whose value is a blob handle.
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 64, func(opts *Options) {
+		opts.ValueSeparationPolicy = func() ValueSeparationPolicy {
+			return ValueSeparationPolicy{
+				Enabled:                true,
+				MinimumSize:            1,
+				MinimumMVCCGarbageSize: 1,
+				MaxBlobReferenceDepth:  10,
+			}
+		}
+	})
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+
+	// Each value is unique. MinimumSize=1 means every non-empty SET value is
+	// separated to a blob.
+	mkValue := func(tag string) []byte {
+		v := make([]byte, 128)
+		copy(v, tag)
+		return v
+	}
+
+	// Layout:
+	//   /tenant/0/k -- straddler outside-span row (lower-boundary block)
+	//   /tenant/1/k0..k4 -- in-span (interior)
+	//   /tenant/2/k -- straddler outside-span row (upper-boundary block)
+	type kv struct {
+		key string
+		val []byte
+	}
+	var pairs []kv
+	pairs = append(pairs, kv{"/tenant/0/k", mkValue("/tenant/0/k")})
+	for i := 0; i < 5; i++ {
+		k := fmt.Sprintf("/tenant/1/k%d", i)
+		pairs = append(pairs, kv{k, mkValue(k)})
+	}
+	pairs = append(pairs, kv{"/tenant/2/k", mkValue("/tenant/2/k")})
+
+	for _, p := range pairs {
+		require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+	}
+	require.NoError(t, d.Flush())
+
+	// Confirm value separation actually produced blob references on the source
+	// SST; otherwise the test would silently degrade to the value-block path.
+	requireBlobRefsOnSource(t, d, srcPrefix)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Read every in-span key back through dst-space. Boundary blocks were
+	// rewritten as a fresh physical SST whose values must match the originals
+	// even though the source stored them as blob handles.
+	for _, p := range pairs {
+		if !strings.HasPrefix(p.key, string(srcPrefix)) {
+			continue
+		}
+		dstKey := string(dstPrefix) + p.key[len(srcPrefix):]
+		require.Equal(t, p.val, mustGet(t, d, dstKey),
+			"dst key %s did not read back the source value", dstKey)
+	}
+
+	// Source-side keys must remain untouched.
+	for _, p := range pairs {
+		require.Equal(t, p.val, mustGet(t, d, p.key))
+	}
+
+	// The new physical SST(s) in dst-space must own no blob references: the
+	// boundary-rewrite path materializes blob-handle values inline.
+	requireNoBlobRefsInDst(t, d, dstPrefix)
+}
+
+// TestVirtualClone_BoundaryBlock_MixedValueShapes verifies that within a
+// single boundary block the resolver dispatches correctly across all three
+// value shapes: inline, value-block-handle, and blob-handle. We tune the value
+// separator so:
+//   - Small non-MVCC-garbage values stay inline.
+//   - Small prefix-equal MVCC SETs are too small to count as MVCC garbage in
+//     the separator (MinimumMVCCGarbageSize gates that), so they remain
+//     inline; the column-block writer's own IsLikelyMVCCGarbage check then
+//     routes them to a value block.
+//   - Large values exceed MinimumSize and are separated to a blob file.
+//
+// A default-sized data block keeps all rows in one block, which by virtue of
+// straddling both srcSpan ends becomes the single boundary block.
+func TestVirtualClone_BoundaryBlock_MixedValueShapes(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 0, func(opts *Options) {
+		opts.ValueSeparationPolicy = func() ValueSeparationPolicy {
+			return ValueSeparationPolicy{
+				Enabled:                true,
+				MinimumSize:            64,
+				MinimumMVCCGarbageSize: 256,
+				MaxBlobReferenceDepth:  10,
+			}
+		}
+	})
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+
+	smallInline := []byte("inline-val") // 10B, no MVCC predecessor.
+	smallMVCC := []byte("mvcc-val")     // 8B, prefix-equal predecessor.
+	largeBlob := []byte(strings.Repeat("L", 128))
+
+	// Out-of-span straddling row at the lower boundary.
+	require.NoError(t, d.Set([]byte("/tenant/0/k"), smallInline, nil))
+	// In-span rows. testkeys orders suffixed keys before unsuffixed, so writing
+	// /tenant/1/k0@9 first then /tenant/1/k0 keeps the writer in increasing
+	// order while making /tenant/1/k0 prefix-equal to its predecessor at write
+	// time, triggering the writer's IsLikelyMVCCGarbage value-block routing.
+	require.NoError(t, d.Set([]byte("/tenant/1/k0@9"), smallInline, nil))
+	require.NoError(t, d.Set([]byte("/tenant/1/k0"), smallMVCC, nil))
+	require.NoError(t, d.Set([]byte("/tenant/1/k1"), largeBlob, nil))
+	// Out-of-span straddling row at the upper boundary.
+	require.NoError(t, d.Set([]byte("/tenant/2/k"), smallInline, nil))
+
+	require.NoError(t, d.Flush())
+
+	// Sanity: the source SST should have at least one blob reference and at
+	// least one value block. (Inline rows leave no attribute imprint.)
+	requireBlobRefsOnSource(t, d, srcPrefix)
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+	bounds := base.UserKeyBoundsEndExclusive(srcPrefix, []byte("/tenant/2/"))
+	var sawValueBlocks bool
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, bounds).All() {
+			require.NoError(t, d.fileCache.withReader(context.Background(),
+				block.NoReadEnv, m,
+				func(r *sstable.Reader, _ sstable.ReadEnv) error {
+					if r.Attributes.Has(sstable.AttributeValueBlocks) {
+						sawValueBlocks = true
+					}
+					return nil
+				}))
+		}
+	}
+	require.True(t, sawValueBlocks,
+		"test setup did not produce a value block in the source SST; the "+
+			"mixed-shape coverage would be incomplete")
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Each cloned key must read back the source value across all three
+	// underlying storage shapes.
+	require.Equal(t, smallInline, mustGet(t, d, "/tenant/4/k0@9"))
+	require.Equal(t, smallMVCC, mustGet(t, d, "/tenant/4/k0"))
+	require.Equal(t, largeBlob, mustGet(t, d, "/tenant/4/k1"))
+
+	// Source-side keys must remain untouched.
+	require.Equal(t, smallInline, mustGet(t, d, "/tenant/0/k"))
+	require.Equal(t, smallInline, mustGet(t, d, "/tenant/1/k0@9"))
+	require.Equal(t, smallMVCC, mustGet(t, d, "/tenant/1/k0"))
+	require.Equal(t, largeBlob, mustGet(t, d, "/tenant/1/k1"))
+	require.Equal(t, smallInline, mustGet(t, d, "/tenant/2/k"))
+
+	requireNoBlobRefsInDst(t, d, dstPrefix)
+}
+
+// TestVirtualClone_FirstAndLastKey_BlobHandleEndpoints exercises the
+// FirstAndLastInternalKeyOfDataBlock path: when an SST straddles srcSpan, the
+// in-span run's bounds are derived by reading the first key of the first
+// in-span block and the last key of the last in-span block. Those reads
+// previously did not materialize values, but blob-handle decoding still walked
+// through the row's value column and crashed on a nil resolver. This test
+// arranges a straddling SST whose in-span run's first and last blocks each
+// have a blob-handle valued endpoint.
+func TestVirtualClone_FirstAndLastKey_BlobHandleEndpoints(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	// Small block size so each in-span key gets its own block: the run's
+	// first and last in-span blocks then have a single row each, whose
+	// value is a blob handle (every value is separated under MinimumSize=1).
+	d := openCloneTestDBWithOpts(t, FormatPrefixSubstitution, 64, func(opts *Options) {
+		opts.ValueSeparationPolicy = func() ValueSeparationPolicy {
+			return ValueSeparationPolicy{
+				Enabled:                true,
+				MinimumSize:            1,
+				MinimumMVCCGarbageSize: 1,
+				MaxBlobReferenceDepth:  10,
+			}
+		}
+	})
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+
+	mkValue := func(tag string) []byte {
+		v := make([]byte, 128)
+		copy(v, tag)
+		return v
+	}
+
+	// One straddling SST with multiple in-span blocks. The run's first and
+	// last in-span blocks each have endpoint values stored in the blob file.
+	type kv struct {
+		key string
+		val []byte
+	}
+	var pairs []kv
+	pairs = append(pairs, kv{"/tenant/0/k", mkValue("/tenant/0/k")})
+	for i := 0; i < 6; i++ {
+		k := fmt.Sprintf("/tenant/1/k%d", i)
+		pairs = append(pairs, kv{k, mkValue(k)})
+	}
+	pairs = append(pairs, kv{"/tenant/2/k", mkValue("/tenant/2/k")})
+
+	for _, p := range pairs {
+		require.NoError(t, d.Set([]byte(p.key), p.val, nil))
+	}
+	require.NoError(t, d.Flush())
+
+	requireBlobRefsOnSource(t, d, srcPrefix)
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// Read every in-span key back through dst-space; the virtual SST cover
+	// of the in-span run uses the first/last-key derived bounds.
+	for _, p := range pairs {
+		if !strings.HasPrefix(p.key, string(srcPrefix)) {
+			continue
+		}
+		dstKey := string(dstPrefix) + p.key[len(srcPrefix):]
+		require.Equal(t, p.val, mustGet(t, d, dstKey),
+			"dst key %s did not read back the source value", dstKey)
+	}
+	// And source-side reads.
+	for _, p := range pairs {
+		require.Equal(t, p.val, mustGet(t, d, p.key))
+	}
+}

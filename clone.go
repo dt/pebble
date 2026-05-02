@@ -14,6 +14,7 @@ import (
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable"
+	"github.com/cockroachdb/pebble/sstable/blob"
 	"github.com/cockroachdb/pebble/sstable/block"
 )
 
@@ -220,6 +221,16 @@ func (d *DB) virtualCloneAttempt(
 
 	srcSpanBounds := srcSpan.UserKeyBounds()
 
+	// Shared blob value fetcher for the lifetime of this attempt. Used by
+	// boundary-block reads (and any other block-level helper) to materialize
+	// values whose handles point into blob files. Per-source TableBlobContexts
+	// constructed downstream wire this fetcher together with the source
+	// table's own BlobReferences.
+	var blobFetcher blob.ValueFetcher
+	blobFetcher.Init(&currentVersion.BlobFiles, d.fileCache,
+		block.ReadEnv{}, blob.SuggestedCachedReaders(currentVersion.MaxReadAmp()))
+	defer func() { _ = blobFetcher.Close() }()
+
 	// Track physical SSTs we wrote pre-VE. On any failure path (retry,
 	// terminal error) before the VE applies, we must remove them from the
 	// object provider to avoid orphan files. Mirrors ingest.go's
@@ -279,7 +290,7 @@ func (d *DB) virtualCloneAttempt(
 			// build a block-aligned virtual TableMetadata + 0-2 boundary
 			// physical SSTs.
 			straddlerEntries, written, err := d.buildStraddlerEntries(
-				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix, survey)
+				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix, survey, &blobFetcher)
 			if err != nil {
 				// Track any objects already written before propagating.
 				preVEObjects = append(preVEObjects, written...)
@@ -540,10 +551,19 @@ func (d *DB) buildStraddlerEntries(
 	srcSpanBounds base.UserKeyBounds,
 	srcPrefix, dstPrefix []byte,
 	survey fragmentSurvey,
+	blobFetcher *blob.ValueFetcher,
 ) (entries []clonePlanEntry, written []base.DiskFileNum, _ error) {
 	if !m.HasPointKeys {
 		return nil, nil, errors.AssertionFailedf(
 			"pebble: VirtualClone source table %s has no point keys", m.TableNum)
+	}
+
+	// Per-source-table blob context. The fetcher is shared across all source
+	// SSTs in this attempt; the References are this source SST's own blob
+	// references (used to map a row's reference index to a blob file ID).
+	blobContext := sstable.TableBlobContext{
+		ValueFetcher: blobFetcher,
+		References:   &m.BlobReferences,
 	}
 
 	var blocks []blockInfo
@@ -667,7 +687,7 @@ func (d *DB) buildStraddlerEntries(
 	if firstInSpan >= 0 {
 		// Per-block precondition validation: every in-span block's stored
 		// shared prefix must start with srcPrefix.
-		if err := d.validateInSpanBlocks(ctx, m, blocks[firstInSpan:lastInSpan+1], srcPrefix); err != nil {
+		if err := d.validateInSpanBlocks(ctx, m, blocks[firstInSpan:lastInSpan+1], srcPrefix, blobContext); err != nil {
 			return nil, nil, err
 		}
 
@@ -690,7 +710,7 @@ func (d *DB) buildStraddlerEntries(
 		// firstKeyOf(blocks[firstInSpan]) and largest =
 		// lastKeyOf(blocks[lastInSpan]). validateInSpanBlocks already opens
 		// these blocks; we extract while we're there.
-		firstIK, lastIK, err := d.firstAndLastKeyOfRun(ctx, m, blocks[firstInSpan], blocks[lastInSpan])
+		firstIK, lastIK, err := d.firstAndLastKeyOfRun(ctx, m, blocks[firstInSpan], blocks[lastInSpan], blobContext)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -806,7 +826,7 @@ func (d *DB) buildStraddlerEntries(
 		}
 		physical, fileNum, err := d.rewriteBoundaryBlock(
 			ctx, m, blocks[idx].handle.Handle, srcSpan, srcSpanBounds,
-			srcPrefix, dstPrefix, level)
+			srcPrefix, dstPrefix, level, blobContext)
 		if err != nil {
 			return err
 		}
@@ -991,7 +1011,11 @@ func (d *DB) surveyAndValidateFragments(
 // Separator behavior that produces a block whose stored shared prefix is
 // shorter than srcPrefix.
 func (d *DB) validateInSpanBlocks(
-	ctx context.Context, m *manifest.TableMetadata, blocks []blockInfo, srcPrefix []byte,
+	ctx context.Context,
+	m *manifest.TableMetadata,
+	blocks []blockInfo,
+	srcPrefix []byte,
+	blobContext sstable.TableBlobContext,
 ) error {
 	if len(blocks) == 0 {
 		return nil
@@ -999,7 +1023,7 @@ func (d *DB) validateInSpanBlocks(
 	return d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
 			for _, b := range blocks {
-				first, last, err := r.FirstAndLastUserKeyOfDataBlock(ctx, b.handle.Handle)
+				first, last, err := r.FirstAndLastUserKeyOfDataBlock(ctx, b.handle.Handle, blobContext)
 				if err != nil {
 					return errors.Wrapf(err,
 						"pebble: VirtualClone failed reading data block of source %s", m.TableNum)
@@ -1017,11 +1041,14 @@ func (d *DB) validateInSpanBlocks(
 // firstAndLastKeyOfRun returns the first InternalKey of firstBlock and the
 // last InternalKey of lastBlock, in storage-prefix space.
 func (d *DB) firstAndLastKeyOfRun(
-	ctx context.Context, m *manifest.TableMetadata, firstBlock, lastBlock blockInfo,
+	ctx context.Context,
+	m *manifest.TableMetadata,
+	firstBlock, lastBlock blockInfo,
+	blobContext sstable.TableBlobContext,
 ) (first, last base.InternalKey, _ error) {
 	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
-			f, l, err := r.FirstAndLastInternalKeyOfDataBlock(ctx, firstBlock.handle.Handle)
+			f, l, err := r.FirstAndLastInternalKeyOfDataBlock(ctx, firstBlock.handle.Handle, blobContext)
 			if err != nil {
 				return err
 			}
@@ -1030,7 +1057,7 @@ func (d *DB) firstAndLastKeyOfRun(
 				last = l
 				return nil
 			}
-			_, l, err = r.FirstAndLastInternalKeyOfDataBlock(ctx, lastBlock.handle.Handle)
+			_, l, err = r.FirstAndLastInternalKeyOfDataBlock(ctx, lastBlock.handle.Handle, blobContext)
 			if err != nil {
 				return err
 			}
@@ -1055,10 +1082,16 @@ func (d *DB) rewriteBoundaryBlock(
 	srcSpanBounds base.UserKeyBounds,
 	srcPrefix, dstPrefix []byte,
 	level int,
+	blobContext sstable.TableBlobContext,
 ) (*manifest.TableMetadata, base.DiskFileNum, error) {
 	cmp := d.cmp
 
-	// Collect (translatedKey, value) pairs for in-span keys.
+	// Collect (translatedKey, value) pairs for in-span keys. Values from
+	// out-of-line storage (value blocks or blob files) are materialized inline
+	// into the new physical SST: blobContext supplies the blob fetcher and
+	// the source SST's BlobReferences mapping. The new boundary SST has no
+	// blob references of its own; the source blob file's refcount is
+	// unaffected (the source SST keeps its reference).
 	type kvPair struct {
 		key   base.InternalKey
 		value []byte
@@ -1066,7 +1099,7 @@ func (d *DB) rewriteBoundaryBlock(
 	var pairs []kvPair
 	if err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
-			return r.IterateDataBlock(ctx, bh, func(k base.InternalKey, v []byte) error {
+			return r.IterateDataBlock(ctx, bh, blobContext, func(k base.InternalKey, v []byte) error {
 				if !srcSpanBounds.ContainsInternalKey(cmp, k) {
 					return nil
 				}
