@@ -10,6 +10,7 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
+	"github.com/cockroachdb/pebble/internal/keyspan"
 	"github.com/cockroachdb/pebble/internal/manifest"
 	"github.com/cockroachdb/pebble/objstorage"
 	"github.com/cockroachdb/pebble/sstable"
@@ -24,7 +25,9 @@ import (
 // Cases that currently return ErrUnsupportedClone:
 //   - A source sstable that uses the row-based block format intersects
 //     srcSpan.
-//   - A source sstable that contains range keys intersects srcSpan.
+//   - A source sstable contains a range deletion or range key whose
+//     [Start, End) interval straddles a srcSpan boundary (partly inside,
+//     partly outside).
 //   - A straddling source sstable's in-span data blocks have a stored
 //     block-shared prefix shorter than srcPrefix.
 //   - All levels are saturated for a cloned file (extreme dst-conflict).
@@ -56,7 +59,8 @@ const virtualCloneMaxRetries = 5
 //
 // Returns ErrUnsupportedClone (with details) for v1 unsupported cases:
 //   - rowblk-format SSTs intersecting srcSpan
-//   - any source SST containing range keys
+//   - a source SST that contains a range deletion or range key whose
+//     [Start, End) interval straddles a srcSpan boundary
 //   - a straddling source SST whose in-span data blocks have a stored
 //     shared prefix shorter than srcPrefix
 //   - destination region is so saturated no level can host a cloned file
@@ -214,11 +218,17 @@ func (d *DB) virtualCloneAttempt(
 	for layer, ls := range currentVersion.AllLevelsAndSublevels() {
 		level := layer.Level()
 		for m := range ls.Overlaps(d.cmp, srcSpanBounds).All() {
-			if m.HasRangeKeys {
+			// Validate that any range deletions and range keys in the source
+			// table either lie entirely inside or entirely outside srcSpan.
+			// Fragments that straddle a srcSpan boundary cannot be cleanly
+			// substituted (we don't split them at the boundary in this slice)
+			// and so we return ErrUnsupportedClone in that case. Also collect
+			// the bounds of any in-span fragments so they can be reflected on
+			// the cloned virtual SST's bounds.
+			survey, err := d.surveyAndValidateFragments(ctx, m, srcSpan, level)
+			if err != nil {
 				cleanupPreVE()
-				return false, errors.Wrapf(ErrUnsupportedClone,
-					"source table %s at L%d intersecting srcSpan contains range keys",
-					m.TableNum, level)
+				return false, err
 			}
 			fullyContained := srcSpanBounds.ContainsInternalKey(d.cmp, m.Smallest()) &&
 				srcSpanBounds.ContainsInternalKey(d.cmp, m.Largest())
@@ -249,7 +259,7 @@ func (d *DB) virtualCloneAttempt(
 			// build a block-aligned virtual TableMetadata + 0-2 boundary
 			// physical SSTs.
 			straddlerEntries, written, err := d.buildStraddlerEntries(
-				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix)
+				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix, survey)
 			if err != nil {
 				// Track any objects already written before propagating.
 				preVEObjects = append(preVEObjects, written...)
@@ -472,6 +482,11 @@ func (d *DB) buildFullyContainedVirtual(
 	smallest := translateInternalKey(srcPrefix, dstPrefix, m.PointKeyBounds.Smallest())
 	largest := translateInternalKey(srcPrefix, dstPrefix, m.PointKeyBounds.Largest())
 	vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
+	if m.HasRangeKeys {
+		rkSmallest := translateInternalKey(srcPrefix, dstPrefix, m.RangeKeyBounds.Smallest())
+		rkLargest := translateInternalKey(srcPrefix, dstPrefix, m.RangeKeyBounds.Largest())
+		vm.ExtendRangeKeyBounds(d.cmp, m.RangeKeyKinds, rkSmallest, rkLargest)
+	}
 
 	vm.AttachVirtualBacking(m.TableBacking)
 	vm.Size = m.Size
@@ -503,6 +518,7 @@ func (d *DB) buildStraddlerEntries(
 	srcSpan KeyRange,
 	srcSpanBounds base.UserKeyBounds,
 	srcPrefix, dstPrefix []byte,
+	survey fragmentSurvey,
 ) (entries []clonePlanEntry, written []base.DiskFileNum, _ error) {
 	if !m.HasPointKeys {
 		return nil, nil, errors.AssertionFailedf(
@@ -672,6 +688,22 @@ func (d *DB) buildStraddlerEntries(
 			},
 		}
 		vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
+		// Extend the virtual SST's point-key bounds to include any in-span
+		// range deletions (which are tracked under point keys), and set its
+		// range-key bounds for any in-span range keys. The fragments are
+		// surfaced via NewRawRangeDelIter / NewRawRangeKeyIter on the virtual
+		// reader, with bounds-truncation against the virtual SST's bounds; so
+		// the bounds must encompass every fragment that should be visible.
+		if survey.hasInSpanRangeDel {
+			vm.ExtendPointKeyBounds(d.cmp,
+				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeDel),
+				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeDel))
+		}
+		if survey.hasInSpanRangeKey {
+			vm.ExtendRangeKeyBounds(d.cmp, survey.rangeKeyKinds,
+				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeKey),
+				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeKey))
+		}
 
 		vm.AttachVirtualBacking(m.TableBacking)
 		// Approximate size by proportion of in-span blocks to total blocks.
@@ -691,6 +723,46 @@ func (d *DB) buildStraddlerEntries(
 		}
 		vm.ValidateVirtual(m)
 
+		entries = append(entries, clonePlanEntry{
+			sourceLevel:   level,
+			source:        m,
+			virtual:       vm,
+			assignedLevel: -1,
+		})
+	} else if survey.hasInSpanRangeDel || survey.hasInSpanRangeKey {
+		// No in-span data block run, but the source has range deletions or
+		// range keys whose bounds lie within srcSpan. Build a virtual SST
+		// whose bounds cover only those fragments (in dst space). Point keys
+		// from the boundary blocks (if any) are exposed via the boundary
+		// physical SSTs; this virtual entry only surfaces fragments.
+		vm := &manifest.TableMetadata{
+			Virtual:               true,
+			TableNum:              d.mu.versions.getNextTableNum(),
+			SeqNums:               m.SeqNums,
+			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
+			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
+				Src: append([]byte(nil), srcPrefix...),
+				Dst: append([]byte(nil), dstPrefix...),
+			},
+		}
+		if survey.hasInSpanRangeDel {
+			vm.ExtendPointKeyBounds(d.cmp,
+				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeDel),
+				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeDel))
+		}
+		if survey.hasInSpanRangeKey {
+			vm.ExtendRangeKeyBounds(d.cmp, survey.rangeKeyKinds,
+				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeKey),
+				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeKey))
+		}
+		vm.AttachVirtualBacking(m.TableBacking)
+		vm.Size = 1
+		determineExcisedTableBlobReferences(m.BlobReferences, m.Size, vm, d.FormatMajorVersion())
+		if err := vm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+			return nil, nil, errors.Wrapf(err,
+				"pebble: VirtualClone produced invalid virtual table for source %s", m.TableNum)
+		}
+		vm.ValidateVirtual(m)
 		entries = append(entries, clonePlanEntry{
 			sourceLevel:   level,
 			source:        m,
@@ -741,6 +813,152 @@ func (d *DB) buildStraddlerEntries(
 type blockInfo struct {
 	separator []byte
 	handle    block.HandleWithProperties
+}
+
+// fragmentSurvey summarizes the result of walking a source table's range
+// deletion and range key blocks to classify each fragment relative to srcSpan.
+//
+// SrcSpace bounds (smallestRangeDel/largestRangeDel/etc.) are in the source
+// table's storage prefix space; the caller is responsible for translating them
+// to dst-prefix space before installing them on a cloned virtual TableMetadata.
+type fragmentSurvey struct {
+	// hasInSpanRangeDel is set if at least one range deletion fragment lies
+	// entirely within srcSpan.
+	hasInSpanRangeDel bool
+	// smallestRangeDel/largestRangeDel are the bounds of the in-span range
+	// deletion fragments, expressed as InternalKeys with appropriate trailers
+	// (largest uses MakeExclusiveSentinelKey for the end). Valid only when
+	// hasInSpanRangeDel is true.
+	smallestRangeDel base.InternalKey
+	largestRangeDel  base.InternalKey
+
+	// hasInSpanRangeKey is set if at least one range key fragment lies entirely
+	// within srcSpan.
+	hasInSpanRangeKey bool
+	smallestRangeKey  base.InternalKey
+	largestRangeKey   base.InternalKey
+	// rangeKeyKinds tracks the union of range key kinds observed among in-span
+	// fragments.
+	rangeKeyKinds manifest.RangeKeyKinds
+}
+
+// surveyAndValidateFragments walks the source table's range deletion and range
+// key blocks (if present), verifies that every fragment's [Start, End)
+// interval lies either entirely inside or entirely outside srcSpan, and
+// returns a fragmentSurvey describing the in-span fragments.
+//
+// A straddling fragment (partly inside, partly outside srcSpan) returns
+// ErrUnsupportedClone with details identifying the offending fragment.
+//
+// Fragments that lie entirely outside srcSpan are harmless: they will be
+// excluded by the cloned virtual SST's bounds. Fragments fully inside
+// srcSpan are translated at iteration time via the substitution-aware
+// fragment iterator.
+func (d *DB) surveyAndValidateFragments(
+	ctx context.Context, m *manifest.TableMetadata, srcSpan KeyRange, level int,
+) (fragmentSurvey, error) {
+	cmp := d.cmp
+	var survey fragmentSurvey
+	walk := func(
+		kind string,
+		iter keyspan.FragmentIterator,
+		recordInSpan func(s *keyspan.Span),
+	) error {
+		if iter == nil {
+			return nil
+		}
+		defer iter.Close()
+		for s, err := iter.First(); s != nil || err != nil; s, err = iter.Next() {
+			if err != nil {
+				return errors.Wrapf(err,
+					"pebble: VirtualClone failed iterating %s of source table %s",
+					kind, m.TableNum)
+			}
+			// Classify the fragment relative to srcSpan = [Start, End).
+			//   fully-outside: s.End <= srcSpan.Start  OR  s.Start >= srcSpan.End
+			//   fully-inside:  s.Start >= srcSpan.Start AND s.End <= srcSpan.End
+			//   straddle:      everything else
+			endLEStart := cmp(s.End, srcSpan.Start) <= 0
+			startGEEnd := cmp(s.Start, srcSpan.End) >= 0
+			if endLEStart || startGEEnd {
+				continue
+			}
+			startInside := cmp(s.Start, srcSpan.Start) >= 0
+			endInside := cmp(s.End, srcSpan.End) <= 0
+			if startInside && endInside {
+				recordInSpan(s)
+				continue
+			}
+			return errors.Wrapf(ErrUnsupportedClone,
+				"source table %s at L%d contains a %s fragment [%s, %s) that straddles srcSpan [%s, %s)",
+				m.TableNum, level, kind,
+				d.opts.Comparer.FormatKey(s.Start), d.opts.Comparer.FormatKey(s.End),
+				d.opts.Comparer.FormatKey(srcSpan.Start), d.opts.Comparer.FormatKey(srcSpan.End))
+		}
+		return nil
+	}
+
+	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			rdel, err := r.NewRawRangeDelIter(ctx, sstable.NoFragmentTransforms, sstable.NoReadEnv)
+			if err != nil {
+				return errors.Wrapf(err,
+					"pebble: VirtualClone failed opening range-del iterator on source %s",
+					m.TableNum)
+			}
+			if err := walk("range deletion", rdel, func(s *keyspan.Span) {
+				smallest := s.SmallestKey()
+				largest := base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeDelete, s.End)
+				if !survey.hasInSpanRangeDel {
+					survey.hasInSpanRangeDel = true
+					survey.smallestRangeDel = smallest.Clone()
+					survey.largestRangeDel = largest.Clone()
+					return
+				}
+				if base.InternalCompare(cmp, smallest, survey.smallestRangeDel) < 0 {
+					survey.smallestRangeDel = smallest.Clone()
+				}
+				if base.InternalCompare(cmp, largest, survey.largestRangeDel) > 0 {
+					survey.largestRangeDel = largest.Clone()
+				}
+			}); err != nil {
+				return err
+			}
+
+			if !m.HasRangeKeys {
+				return nil
+			}
+			rkey, err := r.NewRawRangeKeyIter(ctx, sstable.NoFragmentTransforms, sstable.NoReadEnv)
+			if err != nil {
+				return errors.Wrapf(err,
+					"pebble: VirtualClone failed opening range-key iterator on source %s",
+					m.TableNum)
+			}
+			return walk("range key", rkey, func(s *keyspan.Span) {
+				smallest := s.SmallestKey()
+				// For range keys, the largest is an exclusive sentinel using
+				// the maximum range-key kind. Mirroring keyspan.Span.LargestKey
+				// behavior for the table's bounds.
+				largest := base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeKeyMax, s.End)
+				if !survey.hasInSpanRangeKey {
+					survey.hasInSpanRangeKey = true
+					survey.smallestRangeKey = smallest.Clone()
+					survey.largestRangeKey = largest.Clone()
+				} else {
+					if base.InternalCompare(cmp, smallest, survey.smallestRangeKey) < 0 {
+						survey.smallestRangeKey = smallest.Clone()
+					}
+					if base.InternalCompare(cmp, largest, survey.largestRangeKey) > 0 {
+						survey.largestRangeKey = largest.Clone()
+					}
+				}
+				// We don't have a per-fragment kind classifier here; record
+				// AnyRangeKeys defensively (matches the convention in
+				// excise.go and other callers without precise information).
+				survey.rangeKeyKinds = manifest.AnyRangeKeys
+			})
+		})
+	return survey, err
 }
 
 // validateInSpanBlocks reads each of the provided blocks and verifies that

@@ -64,19 +64,29 @@ func (t *Transforms) SyntheticSuffix() []byte {
 // FragmentTransforms allow on-the-fly transformation of range deletion or
 // range key data at iteration time.
 //
-// Note: BlockPrefixSubstitution is intentionally not represented here. The
-// fragment iterators (range del / range key) do not yet apply the
-// substitution, and silently carrying the field would risk emitting
-// untranslated boundary keys. Range-key support is deferred.
+// BlockPrefixSubstitution is applied by the colblk fragment iterator when
+// emitting fragment user keys (Apply on emit) and inverted on seek keys
+// (Invert on seek), mirroring how the colblk data-block iterator handles the
+// substitution. The row-based fragment iterator does not implement the
+// substitution; the only consumer that sets BlockPrefixSubstitution
+// (VirtualClone) rejects row-based source SSTs before constructing the
+// transform.
 type FragmentTransforms struct {
 	SyntheticSeqNum          SyntheticSeqNum
 	SyntheticPrefixAndSuffix SyntheticPrefixAndSuffix
+
+	// BlockPrefixSubstitution, if set, replaces a leading source prefix with a
+	// destination prefix during fragment user-key materialization (start, end).
+	// Mutually exclusive with SyntheticPrefixAndSuffix's prefix component. See
+	// BlockPrefixSubstitution.
+	BlockPrefixSubstitution BlockPrefixSubstitution
 }
 
 // NoTransforms returns true if there are no transforms enabled.
 func (t *FragmentTransforms) NoTransforms() bool {
 	return t.SyntheticSeqNum == 0 &&
-		t.SyntheticPrefixAndSuffix.IsUnset()
+		t.SyntheticPrefixAndSuffix.IsUnset() &&
+		!t.BlockPrefixSubstitution.IsSet()
 }
 
 func (t *FragmentTransforms) HasSyntheticPrefix() bool {

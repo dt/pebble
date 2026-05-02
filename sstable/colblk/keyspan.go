@@ -290,8 +290,22 @@ func (d *KeyspanDecoder) Describe(f *binfmt.Formatter, tp treeprinter.Node) {
 
 // searchBoundaryKeys returns the index of the first boundary key greater than
 // or equal to key and whether or not the key was found exactly.
-func (d *KeyspanDecoder) searchBoundaryKeysWithSyntheticPrefix(
-	cmp base.Compare, key []byte, syntheticPrefix blockiter.SyntheticPrefix,
+//
+// The seek key is in destination/external space. If a synthetic prefix is set,
+// the seek key's leading bytes must match the synthetic prefix or the seek
+// falls entirely outside the block. If a BlockPrefixSubstitution is set, the
+// seek key's leading bytes must match the substitution's Dst; the iterator
+// then translates the remaining suffix into storage space (by prepending Src)
+// before performing the binary search against the stored boundary keys.
+//
+// At most one of syntheticPrefix and substitution may be set; this is the
+// invariant enforced when constructing FragmentTransforms.
+func (d *KeyspanDecoder) searchBoundaryKeysTransformed(
+	cmp base.Compare,
+	key []byte,
+	syntheticPrefix blockiter.SyntheticPrefix,
+	substitution blockiter.BlockPrefixSubstitution,
+	seekKeyBuf *[]byte,
 ) (index int, equal bool) {
 	if syntheticPrefix.IsSet() {
 		// The seek key must have the synthetic prefix, otherwise it falls entirely
@@ -304,6 +318,22 @@ func (d *KeyspanDecoder) searchBoundaryKeysWithSyntheticPrefix(
 			}
 			return int(d.boundaryKeysCount), false
 		}
+	} else if substitution.IsSet() {
+		var keyPrefix []byte
+		keyPrefix, key = splitKey(key, len(substitution.Dst))
+		if cmp := bytes.Compare(keyPrefix, substitution.Dst); cmp != 0 {
+			if cmp < 0 {
+				return 0, false
+			}
+			return int(d.boundaryKeysCount), false
+		}
+		// Translate from destination-prefix space to storage-prefix space by
+		// prepending Src in place of the (already-stripped) Dst.
+		buf := (*seekKeyBuf)[:0]
+		buf = append(buf, substitution.Src...)
+		buf = append(buf, key...)
+		*seekKeyBuf = buf
+		key = buf
 	}
 
 	i, j := 0, int(d.boundaryKeysCount)
@@ -390,10 +420,16 @@ type keyspanIter struct {
 	//   i.r.userKeys.At(i.startBoundIndex+1)
 	startBoundIndex int
 	keyBuf          [2]keyspan.Key
-	// startKeyBuf and endKeyBuf are used when transforms.SyntheticPrefix is
-	// set.
+	// startKeyBuf and endKeyBuf are used when transforms.SyntheticPrefix or
+	// transforms.BlockPrefixSubstitution is set.
 	startKeyBuf []byte
 	endKeyBuf   []byte
+	// seekKeyBuf is a scratch buffer used to translate a seek key from
+	// destination space to storage space when transforms.BlockPrefixSubstitution
+	// is set. It is reused across Seek calls; consumers of the boundary index
+	// returned by searchBoundaryKeysTransformed must not retain references into
+	// this buffer.
+	seekKeyBuf []byte
 }
 
 // Assert that KeyspanIter implements the FragmentIterator interface.
@@ -415,9 +451,16 @@ func (i *keyspanIter) init(
 	}
 	i.startKeyBuf = i.startKeyBuf[:0]
 	i.endKeyBuf = i.endKeyBuf[:0]
+	i.seekKeyBuf = i.seekKeyBuf[:0]
 	if transforms.HasSyntheticPrefix() {
 		i.startKeyBuf = append(i.startKeyBuf, transforms.SyntheticPrefix()...)
 		i.endKeyBuf = append(i.endKeyBuf, transforms.SyntheticPrefix()...)
+	} else if transforms.BlockPrefixSubstitution.IsSet() {
+		// Pre-fill the start/end key buffers with the destination prefix; the
+		// remainder of each emitted boundary key (after stripping Src) will be
+		// appended in materializeSpan.
+		i.startKeyBuf = append(i.startKeyBuf, transforms.BlockPrefixSubstitution.Dst...)
+		i.endKeyBuf = append(i.endKeyBuf, transforms.BlockPrefixSubstitution.Dst...)
 	}
 }
 
@@ -440,7 +483,9 @@ func (i *keyspanIter) SeekGE(key []byte) (span *keyspan.Span, _ error) {
 	}
 
 	// Seek among the boundary keys.
-	j, eq := i.r.searchBoundaryKeysWithSyntheticPrefix(i.cmp, key, i.transforms.SyntheticPrefix())
+	j, eq := i.r.searchBoundaryKeysTransformed(
+		i.cmp, key, i.transforms.SyntheticPrefix(),
+		i.transforms.BlockPrefixSubstitution, &i.seekKeyBuf)
 	// If the found boundary key does not exactly equal the given key, it's
 	// strictly greater than key. We need to back up one to consider the span
 	// that ends at the this boundary key.
@@ -460,7 +505,9 @@ func (i *keyspanIter) SeekLT(key []byte) (span *keyspan.Span, _ error) {
 			op.Finishf("= %s", spanStr(span))
 		}()
 	}
-	j, _ := i.r.searchBoundaryKeysWithSyntheticPrefix(i.cmp, key, i.transforms.SyntheticPrefix())
+	j, _ := i.r.searchBoundaryKeysTransformed(
+		i.cmp, key, i.transforms.SyntheticPrefix(),
+		i.transforms.BlockPrefixSubstitution, &i.seekKeyBuf)
 	// searchBoundaryKeys seeks to the first boundary key greater than or equal
 	// to key. The span beginning at the boundary key j necessarily does NOT
 	// cover any key less < key (it only contains keys ≥ key). Back up one to
@@ -539,6 +586,26 @@ func (i *keyspanIter) gatherKeysForward(startBoundIndex int) *keyspan.Span {
 			panic(base.CorruptionErrorf("keyspan block has consecutive empty spans"))
 		}
 	}
+	// When BlockPrefixSubstitution is configured, spans whose start key does
+	// not have Src as prefix are outside the substituted region (they belong
+	// to a different prefix in the underlying physical sstable). Advance past
+	// them so that materializeSpan never sees them and never tries to apply
+	// the substitution to a non-Src key.
+	if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		for i.startBoundIndex < int(i.r.boundaryKeysCount)-1 {
+			if bytes.HasPrefix(i.r.boundaryKeys.At(i.startBoundIndex), sub.Src) {
+				break
+			}
+			i.startBoundIndex++
+			if i.startBoundIndex < int(i.r.boundaryKeysCount)-1 && !i.isNonemptySpan(i.startBoundIndex) {
+				// Skip empty span between distinct prefixes.
+				continue
+			}
+		}
+		if i.startBoundIndex >= int(i.r.boundaryKeysCount)-1 {
+			return nil
+		}
+	}
 	return i.materializeSpan()
 }
 
@@ -562,6 +629,22 @@ func (i *keyspanIter) gatherKeysBackward(startBoundIndex int) *keyspan.Span {
 		i.startBoundIndex--
 		if !i.isNonemptySpan(i.startBoundIndex) {
 			panic(base.CorruptionErrorf("keyspan block has consecutive empty spans"))
+		}
+	}
+	// See gatherKeysForward: when BlockPrefixSubstitution is configured,
+	// retreat past spans whose start key is not in Src-prefix space.
+	if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		for i.startBoundIndex >= 0 {
+			if bytes.HasPrefix(i.r.boundaryKeys.At(i.startBoundIndex), sub.Src) {
+				break
+			}
+			i.startBoundIndex--
+			if i.startBoundIndex >= 0 && !i.isNonemptySpan(i.startBoundIndex) {
+				continue
+			}
+		}
+		if i.startBoundIndex < 0 {
+			return nil
 		}
 	}
 	return i.materializeSpan()
@@ -618,7 +701,43 @@ func (i *keyspanIter) materializeSpan() *keyspan.Span {
 			}
 		}
 	}
-	if i.transforms.HasSyntheticPrefix() || invariants.Sometimes(10) {
+	if sub := i.transforms.BlockPrefixSubstitution; sub.IsSet() {
+		// BlockPrefixSubstitution and SyntheticPrefix are mutually exclusive
+		// (enforced by FragmentIterTransforms construction); take this branch
+		// in preference to the SyntheticPrefix branch below so the
+		// invariants.Sometimes path doesn't accidentally bypass substitution.
+		// The stored boundary keys include Src as their leading bytes; strip
+		// Src and prepend Dst into the pre-allocated start/end key buffers.
+		// init() pre-filled the first len(Dst) bytes with Dst, so we only need
+		// to truncate back to len(Dst) and append the post-Src tail.
+		dstLen := len(sub.Dst)
+		i.startKeyBuf = i.startKeyBuf[:dstLen]
+		i.endKeyBuf = i.endKeyBuf[:dstLen]
+		if invariants.Enabled {
+			if !bytes.Equal(i.startKeyBuf, sub.Dst) {
+				panic(errors.AssertionFailedf("keyspanIter: substitution Dst mismatch %q, %q",
+					i.startKeyBuf, sub.Dst))
+			}
+			if !bytes.Equal(i.endKeyBuf, sub.Dst) {
+				panic(errors.AssertionFailedf("keyspanIter: substitution Dst mismatch %q, %q",
+					i.endKeyBuf, sub.Dst))
+			}
+			if !bytes.HasPrefix(i.span.Start, sub.Src) {
+				panic(errors.AssertionFailedf(
+					"keyspanIter: span.Start %q does not have substitution Src %q",
+					i.span.Start, sub.Src))
+			}
+			if !bytes.HasPrefix(i.span.End, sub.Src) {
+				panic(errors.AssertionFailedf(
+					"keyspanIter: span.End %q does not have substitution Src %q",
+					i.span.End, sub.Src))
+			}
+		}
+		i.startKeyBuf = append(i.startKeyBuf, i.span.Start[len(sub.Src):]...)
+		i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(sub.Src):]...)
+		i.span.Start = i.startKeyBuf
+		i.span.End = i.endKeyBuf
+	} else if i.transforms.HasSyntheticPrefix() || invariants.Sometimes(10) {
 		syntheticPrefix := i.transforms.SyntheticPrefix()
 		i.startKeyBuf = i.startKeyBuf[:len(syntheticPrefix)]
 		i.endKeyBuf = i.endKeyBuf[:len(syntheticPrefix)]

@@ -334,9 +334,21 @@ func (m *TableMetadata) IterTransforms() sstable.IterTransforms {
 // FragmentIterTransforms returns an sstable.FragmentIterTransforms populated
 // according to the file.
 func (m *TableMetadata) FragmentIterTransforms() sstable.FragmentIterTransforms {
+	if invariants.Enabled && m.BlockPrefixSubstitution.IsSet() {
+		if !m.Virtual {
+			panic(errors.AssertionFailedf(
+				"pebble: BlockPrefixSubstitution set on non-virtual table %s", m.TableNum))
+		}
+		if m.SyntheticPrefixAndSuffix.HasPrefix() {
+			panic(errors.AssertionFailedf(
+				"pebble: BlockPrefixSubstitution and SyntheticPrefix both set on table %s",
+				m.TableNum))
+		}
+	}
 	return sstable.FragmentIterTransforms{
 		SyntheticSeqNum:          m.SyntheticSeqNum(),
 		SyntheticPrefixAndSuffix: m.SyntheticPrefixAndSuffix,
+		BlockPrefixSubstitution:  m.BlockPrefixSubstitution,
 	}
 }
 

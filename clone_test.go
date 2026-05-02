@@ -1261,3 +1261,284 @@ func TestVirtualClone_TwoLevelIndex_RunCrossesSecondLevelBoundary(t *testing.T) 
 			mustGet(t, d, fmt.Sprintf("/tenant/4/k%05d", i)))
 	}
 }
+
+// scanRangeWithRangeKeys iterates [lower, upper) with KeyTypes=PointsAndRanges
+// and returns the observed point keys plus a flat list of range-key bound
+// strings of the form "[start,end)#kind=suffix:value" for every distinct range
+// key returned. The bounds are recorded each time RangeKeyChanged() is true to
+// avoid duplicates across positioning calls.
+func scanRangeWithRangeKeys(
+	t *testing.T, d *DB, lower, upper []byte,
+) (points []string, ranges []string) {
+	t.Helper()
+	it, err := d.NewIter(&IterOptions{
+		LowerBound: lower,
+		UpperBound: upper,
+		KeyTypes:   IterKeyTypePointsAndRanges,
+	})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, it.Close()) }()
+	for valid := it.First(); valid; valid = it.Next() {
+		hasPoint, hasRange := it.HasPointAndRange()
+		if hasPoint {
+			points = append(points, string(it.Key()))
+		}
+		if hasRange && it.RangeKeyChanged() {
+			start, end := it.RangeBounds()
+			rkData := ""
+			for _, rk := range it.RangeKeys() {
+				rkData += fmt.Sprintf(",%s=%s", string(rk.Suffix), string(rk.Value))
+			}
+			ranges = append(ranges, fmt.Sprintf("[%s,%s)%s", string(start), string(end), rkData))
+		}
+	}
+	return points, ranges
+}
+
+// TestVirtualClone_RangeDelete_FullyInside verifies that a source SST whose
+// only range deletion lies entirely inside srcSpan can be cloned, and that the
+// clone observes the range deletion in dst-space (suppressing point keys it
+// covers).
+func TestVirtualClone_RangeDelete_FullyInside(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Place point keys k1..k5, then a range delete over [k2, k4) — entirely
+	// inside srcSpan.
+	setMany(t, d, []string{
+		"/tenant/1/k1",
+		"/tenant/1/k2",
+		"/tenant/1/k3",
+		"/tenant/1/k4",
+		"/tenant/1/k5",
+	}, value)
+	require.NoError(t, d.DeleteRange([]byte("/tenant/1/k2"), []byte("/tenant/1/k4"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// The dst-space scan should observe k1, k4, k5 (k2 and k3 are deleted).
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k4", "/tenant/4/k5"}, got)
+}
+
+// TestVirtualClone_RangeKeySet_FullyInside verifies that a source SST whose
+// only range key (RangeKeySet) lies entirely inside srcSpan can be cloned, and
+// that the clone observes the range key at translated dst bounds.
+func TestVirtualClone_RangeKeySet_FullyInside(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	setMany(t, d, []string{
+		"/tenant/1/p1",
+		"/tenant/1/p2",
+	}, value)
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/1/ra"),
+		[]byte("/tenant/1/rz"),
+		[]byte("@5"), []byte("rk-value"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	points, ranges := scanRangeWithRangeKeys(t, d,
+		dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/p1", "/tenant/4/p2"}, points)
+	require.Equal(t, []string{
+		"[/tenant/4/ra,/tenant/4/rz),@5=rk-value",
+	}, ranges)
+}
+
+// TestVirtualClone_RangeKey_FullyOutside verifies that a source SST whose
+// range key lies entirely outside srcSpan can be cloned, and that the cloned
+// virtual SST does not expose the range key.
+func TestVirtualClone_RangeKey_FullyOutside(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// Mix in-span point keys with a range key entirely in /tenant/0/ and then
+	// some out-of-span point keys to make the SST straddle the lower bound.
+	setMany(t, d, []string{
+		"/tenant/0/p1",
+		"/tenant/1/p1",
+		"/tenant/1/p2",
+	}, value)
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/0/ra"),
+		[]byte("/tenant/0/rz"),
+		[]byte("@5"), []byte("rk-value"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	points, ranges := scanRangeWithRangeKeys(t, d,
+		dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/p1", "/tenant/4/p2"}, points)
+	require.Empty(t, ranges, "out-of-span range key should not appear in dst")
+}
+
+// TestVirtualClone_RangeKey_Straddling verifies that a source SST whose range
+// key straddles a srcSpan boundary returns ErrUnsupportedClone.
+func TestVirtualClone_RangeKey_Straddling(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	setMany(t, d, []string{"/tenant/1/p1", "/tenant/1/p2"}, value)
+	// Range key from /tenant/1/ra to /tenant/2/rz straddles the upper
+	// bound of srcSpan (/tenant/2/).
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/1/ra"),
+		[]byte("/tenant/2/rz"),
+		[]byte("@5"), []byte("rk-value"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrUnsupportedClone),
+		"expected ErrUnsupportedClone, got %v", err)
+	require.Contains(t, err.Error(), "straddles")
+	require.Contains(t, err.Error(), "range key")
+}
+
+// TestVirtualClone_RangeDel_Straddling verifies that a source SST whose range
+// deletion straddles a srcSpan boundary returns ErrUnsupportedClone.
+func TestVirtualClone_RangeDel_Straddling(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	setMany(t, d, []string{"/tenant/1/p1", "/tenant/1/p2"}, value)
+	require.NoError(t, d.DeleteRange(
+		[]byte("/tenant/1/p1"), []byte("/tenant/2/x"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrUnsupportedClone),
+		"expected ErrUnsupportedClone, got %v", err)
+	require.Contains(t, err.Error(), "straddles")
+	require.Contains(t, err.Error(), "range deletion")
+}
+
+// TestVirtualClone_MixedRangeKeys_InsideAndOutside verifies that an SST with
+// multiple range keys (some entirely inside srcSpan, some entirely outside,
+// none straddling) clones successfully and only exposes the inside ones at
+// dst.
+func TestVirtualClone_MixedRangeKeys_InsideAndOutside(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	setMany(t, d, []string{
+		"/tenant/0/p0",
+		"/tenant/1/p1",
+		"/tenant/1/p2",
+		"/tenant/2/p2",
+	}, value)
+	// Outside (below srcSpan).
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/0/r1a"), []byte("/tenant/0/r1z"),
+		[]byte("@5"), []byte("rk-outside-low"), nil))
+	// Inside.
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/1/r2a"), []byte("/tenant/1/r2z"),
+		[]byte("@5"), []byte("rk-inside"), nil))
+	// Outside (above srcSpan).
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/2/r3a"), []byte("/tenant/2/r3z"),
+		[]byte("@5"), []byte("rk-outside-high"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	points, ranges := scanRangeWithRangeKeys(t, d,
+		dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/p1", "/tenant/4/p2"}, points)
+	require.Equal(t, []string{
+		"[/tenant/4/r2a,/tenant/4/r2z),@5=rk-inside",
+	}, ranges)
+}
+
+// TestVirtualClone_RangeKey_PointStraddler verifies the combined case: an SST
+// whose POINT keys straddle srcSpan (triggering D2 boundary-block rewrite) and
+// which also has a range key entirely inside srcSpan. Both the boundary-block
+// rewrite for points and the in-iter substitution for range keys must work
+// together.
+func TestVirtualClone_RangeKey_PointStraddler(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := make([]byte, 24)
+
+	// Fill enough keys around both bounds to force multiple data blocks and
+	// boundary blocks at both ends of srcSpan.
+	var keys []string
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/0/k%03d", i))
+	}
+	for i := 0; i < 30; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/1/k%03d", i))
+	}
+	for i := 0; i < 5; i++ {
+		keys = append(keys, fmt.Sprintf("/tenant/2/k%03d", i))
+	}
+	setMany(t, d, keys, value)
+	// A range key fully inside srcSpan.
+	require.NoError(t, d.RangeKeySet(
+		[]byte("/tenant/1/ra"),
+		[]byte("/tenant/1/rz"),
+		[]byte("@5"), []byte("rk-inside"), nil))
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+
+	// All 30 in-span point keys should be visible in dst, plus the in-span
+	// range key.
+	points, ranges := scanRangeWithRangeKeys(t, d,
+		dstPrefix, []byte("/tenant/5/"))
+	require.Len(t, points, 30)
+	for i, k := range points {
+		require.Equal(t, fmt.Sprintf("/tenant/4/k%03d", i), k)
+	}
+	require.Equal(t, []string{
+		"[/tenant/4/ra,/tenant/4/rz),@5=rk-inside",
+	}, ranges)
+}
