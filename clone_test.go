@@ -1656,35 +1656,28 @@ func TestVirtualClone_RangeKey_PointStraddler(t *testing.T) {
 	}, ranges)
 }
 
-// TestVirtualClone_PrefixSplitInvariant exercises the Split-position
-// validation in validateVirtualCloneInputs. The check must permit prefixes
-// where Split lands before the end of the prefix as long as the offset
-// (relative to the end of the prefix) matches between src and dst — this is
-// the case for CockroachDB tenant prefixes that carry a trailing sentinel
-// byte. The check must still reject prefixes whose Split positions diverge,
-// since substitution would shift the user-prefix/suffix boundary.
-func TestVirtualClone_PrefixSplitInvariant(t *testing.T) {
+// TestVirtualClone_PrefixLengthInvariant exercises the equal-length validation
+// in validateVirtualCloneInputs. BlockPrefixSubstitution is a literal
+// byte-range replacement at the start of every in-block key; equal-length
+// srcPrefix/dstPrefix keep every byte offset (and therefore every Split
+// result, for any tail-determined Split) unchanged. The check is intentionally
+// independent of Comparer.Split: Split is only contractually defined on full
+// encoded keys, so probing it on raw byte prefixes (e.g. CockroachDB's
+// `\xfe\x8b` tenant prefix, which is not a valid MVCC key on its own) is
+// undefined behavior.
+func TestVirtualClone_PrefixLengthInvariant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	srcSpan := KeyRange{Start: []byte("/tenant/1/"), End: []byte("/tenant/2/")}
 
-	// sentinelComparer mimics the CockroachDB tenant-prefix encoding: the last
-	// byte of any non-empty key is treated as a sentinel and Split returns the
-	// position before it. For prefix-only arguments, this returns
-	// len(prefix)-1, so the delta vs len(prefix) is -1 on both src and dst.
-	sentinelSplit := func(k []byte) int {
-		if len(k) == 0 {
-			return 0
-		}
-		return len(k) - 1
-	}
-	sentinelComparer := &base.Comparer{
+	// nilSplitComparer has no Split function. The validation no longer needs
+	// Split, so this must succeed.
+	nilSplitComparer := &base.Comparer{
 		Compare:        base.DefaultComparer.Compare,
 		Equal:          base.DefaultComparer.Equal,
 		AbbreviatedKey: base.DefaultComparer.AbbreviatedKey,
 		Separator:      base.DefaultComparer.Separator,
 		Successor:      base.DefaultComparer.Successor,
 		FormatKey:      base.DefaultComparer.FormatKey,
-		Split:          sentinelSplit,
 		Name:           base.DefaultComparer.Name,
 	}
 
@@ -1699,79 +1692,42 @@ func TestVirtualClone_PrefixSplitInvariant(t *testing.T) {
 	}
 	cases := []tc{
 		{
-			// Bytewise prefixes through DefaultSplit: Split(prefix) == len(prefix)
-			// on both sides; delta == 0 on both. Must succeed.
-			name: "trivial-split",
+			// Equal-length bytewise prefixes. Must succeed.
+			name: "equal-length",
 			cmp:  base.DefaultComparer,
 			span: srcSpan,
 			src:  []byte("/tenant/1/"),
 			dst:  []byte("/tenant/4/"),
 		},
 		{
-			// CRDB-tenant-prefix-style: Split lands one byte before end of
-			// prefix on both sides. Delta == -1 on both. Must succeed.
-			name: "matched-sentinel-split",
-			cmp:  sentinelComparer,
+			// Validation does not depend on Comparer.Split; a nil Split with
+			// equal-length prefixes is fine.
+			name: "equal-length-nil-split",
+			cmp:  nilSplitComparer,
 			span: srcSpan,
 			src:  []byte("/tenant/1/"),
 			dst:  []byte("/tenant/4/"),
 		},
 		{
-			// Different-length prefixes whose sentinel-style Split positions
-			// still match in offset relative to the end. Delta == -1 on both.
-			name: "matched-sentinel-different-length",
-			cmp:  sentinelComparer,
-			span: KeyRange{Start: []byte("/abc/x"), End: []byte("/abc0")},
-			src:  []byte("/abc/"),
-			dst:  []byte("/zzzzz/"),
+			// Raw CRDB-style tenant prefix that is not a valid encoded key.
+			// The validation must accept it: substitution operates on raw
+			// bytes and never invokes Split on the prefix.
+			name: "raw-tenant-prefix",
+			cmp:  base.DefaultComparer,
+			span: KeyRange{Start: []byte("\xfe\x8b"), End: []byte("\xfe\x8c")},
+			src:  []byte("\xfe\x8b"),
+			dst:  []byte("\xfe\x8c"),
 		},
 		{
-			// Mismatched Split positions: substitution would shift the
-			// user-prefix / suffix boundary. Must be rejected.
-			name: "mismatched-split-positions",
-			cmp: &base.Comparer{
-				Compare:        base.DefaultComparer.Compare,
-				Equal:          base.DefaultComparer.Equal,
-				AbbreviatedKey: base.DefaultComparer.AbbreviatedKey,
-				Separator:      base.DefaultComparer.Separator,
-				Successor:      base.DefaultComparer.Successor,
-				FormatKey:      base.DefaultComparer.FormatKey,
-				// Split that returns the position of the last '@' (or len if
-				// none). The src prefix has a trailing '@', so Split lands
-				// before its end (delta -1). The dst prefix has no '@', so
-				// Split returns len (delta 0). The deltas differ, so
-				// substitution would shift the boundary.
-				Split: func(k []byte) int {
-					for i := len(k) - 1; i >= 0; i-- {
-						if k[i] == '@' {
-							return i
-						}
-					}
-					return len(k)
-				},
-				Name: base.DefaultComparer.Name,
-			},
-			span:              KeyRange{Start: []byte("/tenant/1/@"), End: []byte("/tenant/1/A")},
-			src:               []byte("/tenant/1/@"),
-			dst:               []byte("/tenant/4/"),
-			expectErrContains: "inconsistent Split positions",
-		},
-		{
-			// Nil Split must be rejected.
-			name: "nil-split",
-			cmp: &base.Comparer{
-				Compare:        base.DefaultComparer.Compare,
-				Equal:          base.DefaultComparer.Equal,
-				AbbreviatedKey: base.DefaultComparer.AbbreviatedKey,
-				Separator:      base.DefaultComparer.Separator,
-				Successor:      base.DefaultComparer.Successor,
-				FormatKey:      base.DefaultComparer.FormatKey,
-				Name:           base.DefaultComparer.Name,
-			},
-			span:              srcSpan,
-			src:               []byte("/tenant/1/"),
-			dst:               []byte("/tenant/4/"),
-			expectErrContains: "non-nil Split",
+			// Different-length prefixes are rejected: a length mismatch would
+			// shift every byte offset after the prefix and is unsupported in
+			// v1.
+			name:              "different-length",
+			cmp:               base.DefaultComparer,
+			span:              KeyRange{Start: []byte("/abc/x"), End: []byte("/abc0")},
+			src:               []byte("/abc/"),
+			dst:               []byte("/zzzzz/"),
+			expectErrContains: "must have the same length",
 		},
 	}
 	for _, c := range cases {

@@ -116,32 +116,31 @@ func validateVirtualCloneInputs(
 		return errors.Newf("pebble: VirtualClone srcSpan start %q is not before end %q",
 			srcSpan.Start, srcSpan.End)
 	}
-	if cmp.Split == nil {
-		return errors.New("pebble: VirtualClone requires a Comparer with a non-nil Split")
-	}
-	// Correctness invariant for BlockPrefixSubstitution: substituting srcPrefix
-	// with dstPrefix on every key in a block must preserve the user-prefix /
-	// suffix boundary. For any key shaped as srcPrefix+tail, we need
-	// Split(srcPrefix+tail) and Split(dstPrefix+tail) to point at the same
-	// offset within tail. A sufficient (and the simplest) condition is that the
-	// Split position relative to the end of the prefix matches on both sides:
-	//   Split(srcPrefix) - len(srcPrefix) == Split(dstPrefix) - len(dstPrefix)
+	// Correctness invariant for BlockPrefixSubstitution: srcPrefix is substituted
+	// for dstPrefix as a literal byte-range replacement at the start of every
+	// in-block key, so the byte at offset i in any translated key (for i >=
+	// len(dstPrefix)) corresponds to the byte at offset i + len(srcPrefix) -
+	// len(dstPrefix) in the original. Requiring equal-length prefixes makes that
+	// shift zero, so every byte offset (and therefore every Split result, for
+	// any tail-determined Comparer.Split) is preserved. This is the simplest
+	// sufficient condition and covers the v1 caller (CockroachDB tenant clone
+	// with same-length varint tenant IDs).
 	//
-	// The previous, stricter form required Split to land exactly at the end of
-	// the prefix (Split(prefix) == len(prefix)). That rejected real-world
-	// CockroachDB tenant prefixes, which carry a trailing sentinel byte that
-	// causes Split to position before the end. Such prefixes are still safe to
-	// substitute as long as srcPrefix and dstPrefix have matching trailing
-	// "suffix-like" tails. Do not strengthen this back without considering the
-	// CRDB tenant-prefix encoding.
-	srcSplitDelta := cmp.Split(srcPrefix) - len(srcPrefix)
-	dstSplitDelta := cmp.Split(dstPrefix) - len(dstPrefix)
-	if srcSplitDelta != dstSplitDelta {
+	// We deliberately do NOT call Comparer.Split on srcPrefix or dstPrefix here:
+	// Split is contractually defined on full encoded keys, and producing a
+	// well-defined result for an arbitrary byte prefix is not required. CRDB's
+	// Split, for example, reads a trailing length byte and returns nonsense for
+	// inputs that aren't full keys. Earlier revisions of this check did probe
+	// Split on the prefixes; that was both unsound (undefined behavior on
+	// non-keys) and an unhelpful proxy (it rejected raw tenant prefixes that
+	// are correct, while accepting "engine-encoded" prefixes that no real key
+	// in the source span actually starts with). Don't reintroduce a Split-based
+	// check here without first defining Split's contract on partial keys.
+	if len(srcPrefix) != len(dstPrefix) {
 		return errors.Newf(
-			"pebble: VirtualClone srcPrefix and dstPrefix have inconsistent Split positions "+
-				"(Split(srcPrefix)-len(srcPrefix)=%d, Split(dstPrefix)-len(dstPrefix)=%d); "+
-				"substitution would shift the user-prefix/suffix boundary",
-			srcSplitDelta, dstSplitDelta)
+			"pebble: VirtualClone srcPrefix and dstPrefix must have the same length "+
+				"(len(srcPrefix)=%d, len(dstPrefix)=%d)",
+			len(srcPrefix), len(dstPrefix))
 	}
 	if !bytes.HasPrefix(srcSpan.Start, srcPrefix) {
 		return errors.Newf(
