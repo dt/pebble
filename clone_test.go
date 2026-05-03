@@ -282,10 +282,10 @@ func TestVirtualClone_FormatGate(t *testing.T) {
 	require.Contains(t, err.Error(), "format major version")
 }
 
-// TestVirtualClone_DestinationConflictPlacedInL0 verifies D2's top-down,
-// source-floored level placement: when the destination region is occupied at
-// L0, the cloned file is also placed at L0 (since L0 always tolerates overlap).
-func TestVirtualClone_DestinationConflictPlacedInL0(t *testing.T) {
+// TestVirtualClone_DestinationExcised verifies that VirtualClone atomically
+// excises any pre-existing data in the dst region: the post-condition is that
+// dst is a snapshot of src, regardless of what dst contained beforehand.
+func TestVirtualClone_DestinationExcised(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
 	defer func() { require.NoError(t, d.Close()) }()
@@ -294,8 +294,8 @@ func TestVirtualClone_DestinationConflictPlacedInL0(t *testing.T) {
 	dstPrefix := []byte("/tenant/4/")
 	value := []byte("v")
 
-	// Put data at the destination first.
-	setMany(t, d, []string{"/tenant/4/k1", "/tenant/4/k2"}, value)
+	// Put data at the destination first; these must NOT survive the clone.
+	setMany(t, d, []string{"/tenant/4/k1", "/tenant/4/k2", "/tenant/4/zzz"}, value)
 	require.NoError(t, d.Flush())
 	// And data at the source.
 	setMany(t, d, []string{"/tenant/1/k1", "/tenant/1/k2"}, value)
@@ -304,11 +304,9 @@ func TestVirtualClone_DestinationConflictPlacedInL0(t *testing.T) {
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
 	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
 
-	// All four destination keys (the original + the cloned ones) should be
-	// readable.
-	for _, k := range []string{"/tenant/4/k1", "/tenant/4/k2"} {
-		require.Equal(t, value, mustGet(t, d, k))
-	}
+	// The dst region should now hold only the cloned src keys.
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2"}, got)
 }
 
 func TestVirtualClone_EmptySrcSpan(t *testing.T) {
@@ -2117,8 +2115,8 @@ func TestVirtualClone_CRDBShape_Smoke(t *testing.T) {
 		}
 	}
 	require.GreaterOrEqual(t, dstLevelsOccupied, 2,
-		"dst region should occupy at least two levels so that "+
-			"assignClonedFileLevels has to walk past occupied levels")
+		"dst region should occupy at least two levels so that the dst-excise "+
+			"path has to walk past occupied levels")
 
 	// 5. Run the clone.
 	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
@@ -2146,28 +2144,25 @@ func TestVirtualClone_CRDBShape_Smoke(t *testing.T) {
 		require.NoError(t, closer.Close())
 	}
 
-	// 8. Scan over the dst region and confirm the result set contains the
-	//    union of pre-existing dst keys and the cloned src keys (both in
-	//    dst space).
+	// 8. Scan over the dst region and confirm the result set is exactly the
+	//    cloned src keys: VirtualClone excises the dst region atomically with
+	//    install, so the pre-existing dst keys must be gone.
 	gotKeys := scanRange(t, d, dstPrefix, []byte{0xfe, 0x8d})
 	gotSet := make(map[string]struct{}, len(gotKeys))
 	for _, k := range gotKeys {
 		gotSet[k] = struct{}{}
 	}
+	expectedSet := make(map[string]struct{}, len(srcPairs))
 	for _, p := range srcPairs {
 		dstKey := string(dstPrefix) + p.key[len(srcPrefix):]
+		expectedSet[dstKey] = struct{}{}
 		if _, ok := gotSet[dstKey]; !ok {
 			t.Errorf("dst-space scan missing cloned key %x", dstKey)
 		}
 	}
-	for _, base := range []string{"dstdeep", "dstmid"} {
-		for i := 0; i < 6; i++ {
-			for _, suffix := range []string{"@2", "@1"} {
-				k := string(dstPrefix) + fmt.Sprintf("%s%03d", base, i) + suffix
-				if _, ok := gotSet[k]; !ok {
-					t.Errorf("dst-space scan missing pre-existing dst key %x", k)
-				}
-			}
+	for k := range gotSet {
+		if _, ok := expectedSet[k]; !ok {
+			t.Errorf("dst-space scan contains unexpected key %x (pre-existing dst key should have been excised)", k)
 		}
 	}
 }

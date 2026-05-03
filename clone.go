@@ -83,9 +83,13 @@ func (d *DB) VirtualClone(
 	if err := validateVirtualCloneInputs(d.opts.Comparer, srcSpan, srcPrefix, dstPrefix); err != nil {
 		return err
 	}
+	dstSpan, err := computeDstSpan(srcSpan, srcPrefix, dstPrefix)
+	if err != nil {
+		return err
+	}
 
 	for attempt := 0; attempt < virtualCloneMaxRetries; attempt++ {
-		retried, err := d.virtualCloneAttempt(ctx, attempt, srcSpan, srcPrefix, dstPrefix)
+		retried, err := d.virtualCloneAttempt(ctx, attempt, srcSpan, srcPrefix, dstPrefix, dstSpan)
 		if err != nil {
 			return err
 		}
@@ -95,6 +99,56 @@ func (d *DB) VirtualClone(
 	}
 	return errors.Newf("pebble: VirtualClone exhausted %d retries due to concurrent LSM mutations",
 		virtualCloneMaxRetries)
+}
+
+// computeDstSpan returns the dst-prefix-space span derived from srcSpan: the
+// region of dst keys that VirtualClone owns and will excise atomically with
+// the install of any cloned virtual/physical SSTs. The returned span is
+// independent of which (if any) source data falls into srcSpan — the
+// post-condition of VirtualClone is that the dst span is a snapshot of src,
+// and that snapshot is empty when src is empty.
+//
+// srcSpan.Start is guaranteed by validateVirtualCloneInputs to start with
+// srcPrefix, so dstSpan.Start is a straight bytewise translation. srcSpan.End
+// has two cases:
+//
+//   - It starts with srcPrefix (e.g. srcSpan = [/t/1/k5, /t/1/k9)): translate
+//     bytewise.
+//   - It does not (e.g. srcSpan = [/t/1/, /t/2/)): the caller wants every
+//     key with srcPrefix at or above srcSpan.Start cloned, so the
+//     corresponding dst region is everything with dstPrefix at or above
+//     dstSpan.Start. We close that with bytesPrefixEnd(dstPrefix), the
+//     smallest byte string strictly greater than every byte string starting
+//     with dstPrefix.
+func computeDstSpan(srcSpan KeyRange, srcPrefix, dstPrefix []byte) (KeyRange, error) {
+	start := translateUserKey(srcPrefix, dstPrefix, srcSpan.Start)
+	var end []byte
+	if bytes.HasPrefix(srcSpan.End, srcPrefix) {
+		end = translateUserKey(srcPrefix, dstPrefix, srcSpan.End)
+	} else {
+		end = bytesPrefixEnd(dstPrefix)
+		if end == nil {
+			return KeyRange{}, errors.Newf(
+				"pebble: VirtualClone cannot derive dst excise span: dstPrefix %q has no representable bytes-prefix successor",
+				dstPrefix)
+		}
+	}
+	return KeyRange{Start: start, End: end}, nil
+}
+
+// bytesPrefixEnd returns the smallest byte string strictly greater than every
+// byte string having `prefix` as a bytes-prefix. It increments the last
+// non-0xff byte and truncates trailing 0xff bytes. Returns nil if `prefix` is
+// empty or consists entirely of 0xff bytes (no representable upper bound).
+func bytesPrefixEnd(prefix []byte) []byte {
+	end := append([]byte(nil), prefix...)
+	for i := len(end) - 1; i >= 0; i-- {
+		if end[i] < 0xff {
+			end[i]++
+			return end[:i+1]
+		}
+	}
+	return nil
 }
 
 // validateVirtualCloneInputs checks the static preconditions of VirtualClone.
@@ -194,15 +248,18 @@ type clonePlanEntry struct {
 
 // virtualCloneAttempt performs one attempt at VirtualClone.
 func (d *DB) virtualCloneAttempt(
-	ctx context.Context, attempt int, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
+	ctx context.Context, attempt int, srcSpan KeyRange, srcPrefix, dstPrefix []byte, dstSpan KeyRange,
 ) (retried bool, _ error) {
-	// Before snapshotting the version, check whether any memtable contains keys
-	// overlapping srcSpan. If so, force a flush and wait for it before
-	// proceeding; otherwise recent writes to keys in srcSpan that haven't yet
-	// flushed would be silently absent from the cloned destination. This
-	// mirrors the pattern used by DB.Compact (db.go:1810-1859) and the
-	// memtable-overlap handling in DB.ingest (ingest.go:1863-1962).
-	if retried, err := d.flushMemtablesOverlappingClone(ctx, srcSpan); err != nil || retried {
+	// Before snapshotting the version, check whether any memtable contains
+	// keys overlapping srcSpan or dstSpan. If so, force a flush and wait for
+	// it before proceeding. The src wait is required because recent writes to
+	// keys in srcSpan that haven't yet flushed would otherwise be silently
+	// absent from the cloned destination. The dst wait is required because
+	// VirtualClone atomically excises dstSpan; unflushed writes to dstSpan
+	// would silently survive the excise. This mirrors the pattern used by
+	// DB.Compact (db.go:1810-1859) and the memtable-overlap handling in
+	// DB.ingest (ingest.go:1863-1962).
+	if retried, err := d.flushMemtablesOverlappingClone(ctx, srcSpan, dstSpan); err != nil || retried {
 		return retried, err
 	}
 
@@ -302,14 +359,36 @@ func (d *DB) virtualCloneAttempt(
 		}
 	}
 
-	if len(entries) == 0 {
-		return false, nil
+	dstSpanBounds := dstSpan.UserKeyBounds()
+
+	// Source/destination keyspan disjointness: VirtualClone owns dstSpan and
+	// will excise it. If a source SST's bounds extend into dstSpan, the same
+	// physical file would be touched by both the source-stand-in path and the
+	// dst-excise path (producing conflicting DeletedTables entries). This is a
+	// pathological layout (a single SST spanning both src-prefix and dst-prefix
+	// keys); reject it as ErrUnsupportedClone.
+	for _, e := range entries {
+		if e.source == nil {
+			continue
+		}
+		if dstSpanBounds.Overlaps(d.cmp, e.source.UserKeyBounds()) {
+			cleanupPreVE()
+			return false, errors.Wrapf(ErrUnsupportedClone,
+				"source table %s at L%d has bounds overlapping the dst excise span (smallest=%s largest=%s)",
+				e.source.TableNum, e.sourceLevel,
+				e.source.Smallest().Pretty(d.opts.Comparer.FormatKey),
+				e.source.Largest().Pretty(d.opts.Comparer.FormatKey))
+		}
 	}
 
-	// Assign levels top-down with source-level floor.
-	if err := assignClonedFileLevels(d.cmp, currentVersion, entries); err != nil {
-		cleanupPreVE()
-		return false, err
+	// Each cloned entry is placed at its source level. After dst excise,
+	// dstSpan is empty at every level, so cloned-file bounds (which lie within
+	// dstSpan) cannot overlap any surviving file at any level. Within a single
+	// source level, two cloned files originate from non-overlapping source
+	// SSTs (LSM invariant) and so their dst-translated bounds also don't
+	// overlap.
+	for i := range entries {
+		entries[i].assignedLevel = entries[i].sourceLevel
 	}
 
 	// Test hook: invoked just before re-acquiring d.mu and applying the
@@ -337,22 +416,6 @@ func (d *DB) virtualCloneAttempt(
 				aborted = true
 				return versionUpdate{}, nil
 			}
-		}
-		// Re-validate placement: at the assigned level, the cloned file's
-		// bounds must still not overlap. If overlap appeared (concurrent
-		// compaction installed a new file), abort to recompute.
-		for _, e := range entries {
-			meta := e.virtual
-			if meta == nil {
-				meta = e.physical
-			}
-			if e.assignedLevel > 0 {
-				if current.HasOverlap(e.assignedLevel, meta.UserKeyBounds()) {
-					aborted = true
-					return versionUpdate{}, nil
-				}
-			}
-			// L0 always tolerates overlap.
 		}
 
 		ve := &manifest.VersionEdit{}
@@ -439,6 +502,56 @@ func (d *DB) virtualCloneAttempt(
 			ve.CreatedBackingTables = append(ve.CreatedBackingTables, e.source.TableBacking)
 		}
 
+		// Excise dstSpan against the live version. VirtualClone's contract
+		// is that dst becomes a snapshot of src, so any pre-existing data in
+		// dstSpan must be removed atomically with the install of any cloned
+		// virtual/physical SSTs. We compute the deletion set from `current`
+		// (not the read-phase snapshot) so we capture files added by
+		// concurrent flushes/compactions between our snapshot and the apply.
+		//
+		// Source files (which we replace with a stand-in in this same VE)
+		// have srcPrefix bounds and so cannot overlap dstSpan; the
+		// pre-flight check above already rejected the pathological case of
+		// a single source SST whose bounds extend into dstSpan.
+		//
+		// TODO: thread an excise sequence number allocated via the commit
+		// pipeline so concurrent EFOS protected ranges over dstSpan are
+		// honored. For now we record the current logSeqNum as a best-effort
+		// marker; the dst-tenant-clone use case (which assumes dst is empty
+		// and not under concurrent access) does not exercise EFOS overlap.
+		exciseSeqNum := d.mu.versions.logSeqNum.Load()
+		var anyExcised bool
+		for layer, ls := range current.AllLevelsAndSublevels() {
+			for m := range ls.Overlaps(d.cmp, dstSpanBounds).All() {
+				leftTable, rightTable, err := d.exciseTable(
+					ctx, dstSpanBounds, m, layer.Level(), tightExciseBoundsIfLocal)
+				if err != nil {
+					return versionUpdate{}, err
+				}
+				applyExciseToVersionEdit(ve, m, leftTable, rightTable, layer.Level())
+				anyExcised = true
+			}
+		}
+		if anyExcised {
+			ve.ExciseBoundsRecord = append(ve.ExciseBoundsRecord, manifest.ExciseOpEntry{
+				Bounds: dstSpanBounds,
+				SeqNum: exciseSeqNum,
+			})
+			// Cancel any in-progress compaction whose output bounds overlap
+			// dstSpan: the compaction may write a file landing in dstSpan
+			// after the excise applies, defeating it. Mirrors the pattern in
+			// ingest.go:2457-2487.
+			for c := range d.mu.compact.inProgress {
+				if c.VersionEditApplied() {
+					continue
+				}
+				bounds := c.Bounds()
+				if bounds != nil && bounds.Overlaps(d.cmp, dstSpanBounds) {
+					c.Cancel()
+				}
+			}
+		}
+
 		var metrics levelMetricsDelta
 		for _, e := range entries {
 			meta := e.virtual
@@ -447,6 +560,11 @@ func (d *DB) virtualCloneAttempt(
 			}
 			levelMetrics := metrics.level(e.assignedLevel)
 			levelMetrics.TablesIngested.Inc(meta.Size)
+		}
+
+		// If there is nothing to clone and nothing to excise, skip the VE.
+		if len(entries) == 0 && !anyExcised {
+			return versionUpdate{}, nil
 		}
 
 		return versionUpdate{
@@ -469,17 +587,17 @@ func (d *DB) virtualCloneAttempt(
 }
 
 // flushMemtablesOverlappingClone walks d.mu.mem.queue and forces a flush of
-// the newest memtable whose contents overlap srcSpan, waiting for the flush
-// to complete before returning. The returned retried bool is true when a
-// flush was forced (signalling the caller to start a fresh attempt with a
-// fresh version snapshot).
+// the newest memtable whose contents overlap srcSpan or dstSpan, waiting for
+// the flush to complete before returning. The returned retried bool is true
+// when a flush was forced (signalling the caller to start a fresh attempt
+// with a fresh version snapshot).
 //
 // This mirrors the memtable-overlap pattern in DB.Compact (db.go:1810-1859):
 // walk the queue from newest to oldest, find the newest overlapping
 // memtable, force a rotation if it's the mutable one, schedule a flush, and
 // then wait on the flushed channel.
 func (d *DB) flushMemtablesOverlappingClone(
-	ctx context.Context, srcSpan KeyRange,
+	ctx context.Context, srcSpan, dstSpan KeyRange,
 ) (retried bool, _ error) {
 	d.mu.Lock()
 	mem, err := func() (*flushableEntry, error) {
@@ -492,7 +610,7 @@ func (d *DB) flushMemtablesOverlappingClone(
 			mem.computePossibleOverlaps(func(b bounded) shouldContinue {
 				anyOverlaps = true
 				return stopIteration
-			}, srcSpan)
+			}, srcSpan, dstSpan)
 			if !anyOverlaps {
 				continue
 			}
@@ -1266,74 +1384,4 @@ func (d *DB) rewriteBoundaryBlock(
 			"pebble: VirtualClone boundary table %s is invalid", pm.TableNum)
 	}
 	return pm, fileNum, nil
-}
-
-// assignClonedFileLevels assigns each entry's destination level using a
-// top-down, source-floor algorithm. Entries are processed in source-level
-// order (already the order produced by the caller). For each entry, walk
-// levels from the source level down to L6, picking the first deeper level
-// where the entry's dst-bounds don't overlap any existing file. Already-
-// assigned cloned files at the candidate level are also taken into account.
-// If no level (down to L6) is suitable, the entry is placed at the source
-// level (where the caller will detect the overlap and abort if necessary).
-//
-// L0 is special: a file originating at L0 may always be placed somewhere in
-// L0 or below; we treat L0 as always available.
-func assignClonedFileLevels(
-	cmp base.Compare, current *manifest.Version, entries []clonePlanEntry,
-) error {
-	// Track in-progress placements at each level so subsequent entries see
-	// each other's bounds.
-	type placedBound struct {
-		bounds base.UserKeyBounds
-	}
-	placed := make(map[int][]placedBound)
-	overlapsPlaced := func(level int, b base.UserKeyBounds) bool {
-		for _, p := range placed[level] {
-			pBounds := p.bounds
-			if pBounds.Overlaps(cmp, b) {
-				return true
-			}
-		}
-		return false
-	}
-
-	for i := range entries {
-		e := &entries[i]
-		meta := e.virtual
-		if meta == nil {
-			meta = e.physical
-		}
-		bounds := meta.UserKeyBounds()
-
-		startLevel := e.sourceLevel
-		// Walk from source level down to L6, looking for a level whose
-		// existing files don't overlap our bounds.
-		bestLevel := -1
-		for level := numLevels - 1; level >= startLevel; level-- {
-			if level == 0 {
-				// L0 always accepts overlap.
-				bestLevel = level
-				continue
-			}
-			if !current.HasOverlap(level, bounds) && !overlapsPlaced(level, bounds) {
-				bestLevel = level
-				// Prefer deepest level (lower write-amp later); since we walk
-				// from L6 upward, we record the first non-overlap and break.
-				break
-			}
-		}
-		// If even L0 isn't usable (we never set bestLevel), error.
-		if bestLevel == -1 {
-			// startLevel could be > 0; we may have walked startLevel..L6 and
-			// found nothing. Try L0 as a last resort if startLevel > 0.
-			// Actually our floor is startLevel; we cannot go shallower.
-			return errors.Wrapf(ErrUnsupportedClone,
-				"VirtualClone: no level >= L%d (source level) is free of overlap for cloned table %s",
-				startLevel, meta.TableNum)
-		}
-		e.assignedLevel = bestLevel
-		placed[bestLevel] = append(placed[bestLevel], placedBound{bounds: bounds})
-	}
-	return nil
 }
