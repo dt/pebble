@@ -345,8 +345,46 @@ func (b *PrefixBytes) SetAt(it *PrefixBytesIter, i int) {
 	// (not once per block-iterator setup), so the guard executes per call;
 	// the per-call cost is a single compare on hot data already in cache.
 	if it.skipShared > uint32(b.sharedPrefixLen) {
-		panic(errors.AssertionFailedf("BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d",
-			errors.Safe(it.skipShared), errors.Safe(b.sharedPrefixLen)))
+		// Capture the actual stored block-shared-prefix bytes and the row's
+		// bundle prefix + suffix so the failure mode is fully self-describing
+		// (sharedPrefixLen=0 with no other context makes it impossible to
+		// tell whether the block has a single-row layout, a multi-tenant
+		// layout, or some other shape that violates substitution's invariant).
+		var storedSharedHex, bundleHex, rowSuffixHex string
+		if b.sharedPrefixLen > 0 && b.rawBytes.data != nil {
+			storedSharedHex = fmt.Sprintf("%x",
+				unsafe.Slice((*byte)(b.rawBytes.data), b.sharedPrefixLen))
+		}
+		if bundlePrefixLen > 0 && b.rawBytes.data != nil {
+			bundleHex = fmt.Sprintf("%x",
+				unsafe.Slice(
+					(*byte)(unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(bundleOffsetStart))),
+					bundlePrefixLen))
+		}
+		if rowSuffixLen > 0 && b.rawBytes.data != nil {
+			rowSuffixHex = fmt.Sprintf("%x",
+				unsafe.Slice(
+					(*byte)(unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(rowSuffixStart))),
+					rowSuffixLen))
+		}
+		panic(errors.AssertionFailedf(
+			"BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d "+
+				"(rows=%d, bundleSize=%d, row=%d, bundleOffsetIndex=%d, "+
+				"bundlePrefixLen=%d, rowSuffixLen=%d, sub.DstLen=%d, sub.Dst=%x, "+
+				"storedSharedPrefix=%s, bundlePrefix=%s, rowSuffix=%s)",
+			errors.Safe(it.skipShared),
+			errors.Safe(b.sharedPrefixLen),
+			errors.Safe(b.rows),
+			errors.Safe(1<<b.bundleShift),
+			errors.Safe(i),
+			errors.Safe(bundleOffsetIndex),
+			errors.Safe(bundlePrefixLen),
+			errors.Safe(rowSuffixLen),
+			errors.Safe(it.prependLen),
+			errors.Safe(it.Buf[:it.prependLen]),
+			errors.Safe(storedSharedHex),
+			errors.Safe(bundleHex),
+			errors.Safe(rowSuffixHex)))
 	}
 	effectiveSharedPrefixLen := uint32(b.sharedPrefixLen) - it.skipShared
 	it.sharedAndBundlePrefixLen = it.prependLen + effectiveSharedPrefixLen + bundlePrefixLen
@@ -424,8 +462,40 @@ func (b *PrefixBytes) SetNext(it *PrefixBytesIter) {
 	// See SetAt: this guard is unconditional to prevent uint32 underflow and
 	// subsequent heap corruption via memmove in production builds.
 	if it.skipShared > uint32(b.sharedPrefixLen) {
-		panic(errors.AssertionFailedf("BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d",
-			errors.Safe(it.skipShared), errors.Safe(b.sharedPrefixLen)))
+		var storedSharedHex, bundleHex, rowSuffixHex string
+		if b.sharedPrefixLen > 0 && b.rawBytes.data != nil {
+			storedSharedHex = fmt.Sprintf("%x",
+				unsafe.Slice((*byte)(b.rawBytes.data), b.sharedPrefixLen))
+		}
+		if bundlePrefixLen > 0 && b.rawBytes.data != nil {
+			bundleHex = fmt.Sprintf("%x",
+				unsafe.Slice(
+					(*byte)(unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(bundlePrefixStart))),
+					bundlePrefixLen))
+		}
+		if rowSuffixLen > 0 && b.rawBytes.data != nil {
+			rowSuffixHex = fmt.Sprintf("%x",
+				unsafe.Slice(
+					(*byte)(unsafe.Pointer(uintptr(b.rawBytes.data)+uintptr(rowSuffixStart))),
+					rowSuffixLen))
+		}
+		panic(errors.AssertionFailedf(
+			"BlockPrefixSubstitution skip %d exceeds stored shared prefix length %d (SetNext path) "+
+				"(rows=%d, bundleSize=%d, offsetIndex=%d, "+
+				"bundlePrefixLen=%d, rowSuffixLen=%d, sub.DstLen=%d, sub.Dst=%x, "+
+				"storedSharedPrefix=%s, bundlePrefix=%s, rowSuffix=%s)",
+			errors.Safe(it.skipShared),
+			errors.Safe(b.sharedPrefixLen),
+			errors.Safe(b.rows),
+			errors.Safe(1<<b.bundleShift),
+			errors.Safe(it.offsetIndex),
+			errors.Safe(bundlePrefixLen),
+			errors.Safe(rowSuffixLen),
+			errors.Safe(it.prependLen),
+			errors.Safe(it.Buf[:it.prependLen]),
+			errors.Safe(storedSharedHex),
+			errors.Safe(bundleHex),
+			errors.Safe(rowSuffixHex)))
 	}
 	effectiveSharedPrefixLen := uint32(b.sharedPrefixLen) - it.skipShared
 	it.sharedAndBundlePrefixLen = it.prependLen + effectiveSharedPrefixLen + bundlePrefixLen

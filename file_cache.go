@@ -680,15 +680,19 @@ func (h *fileCacheHandle) newPointIter(
 			r.TryAddBlockPropertyFilterForHideObsoletePoints(
 				opts.snapshotForHideObsoletePoints, file.SeqNums.High, opts.PointKeyFilters)
 
-		// TODO(clone): Block-property filters are computed at write time over
-		// storage-space (Src) keys, so probing them with destination-space (Dst)
-		// keys without inversion would give wrong answers. For VirtualClone v1
-		// we disable block-property filtering entirely on virtual SSTs that
-		// carry a BlockPrefixSubstitution. Inversion-aware probing is the
-		// longer-term fix.
+		// VirtualClone-substituted virtual SSTs share the source's physical
+		// backing, including its per-block "is-obsolete" property bits set
+		// during prior compactions in source-space context. Those bits are
+		// meaningless in destination-space — applying the obsolete-key
+		// block-property filter to a substituted virtual SST silently elides
+		// data blocks whose keys are live in dst (we just installed them via
+		// the clone) but happen to be marked obsolete in source. Disable
+		// both block-property filtering and the obsolete-points block
+		// filter on substituted virtual SSTs.
 		if file.BlockPrefixSubstitution.IsSet() {
 			pointKeyFilters = nil
 			internalOpts.boundLimitedFilter = nil
+			hideObsoletePoints = false
 		}
 
 		var ok bool

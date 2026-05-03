@@ -31,7 +31,6 @@ import (
 //     partly outside).
 //   - A straddling source sstable's in-span data blocks have a stored
 //     block-shared prefix shorter than srcPrefix.
-//   - All levels are saturated for a cloned file (extreme dst-conflict).
 var ErrUnsupportedClone = errors.New("pebble: unsupported VirtualClone case")
 
 // virtualCloneMaxRetries bounds the number of times VirtualClone will retry
@@ -43,7 +42,47 @@ const virtualCloneMaxRetries = 5
 // creates virtual SSTs (sharing existing physical backings) that expose the
 // intersected keys under dstPrefix instead of srcPrefix.
 //
-// srcSpan must lie entirely within [srcPrefix, srcPrefix.ImmediateSuccessor).
+// Parameter encoding contract:
+//
+//	┌───────────────────┬──────────────────────────────┬──────────────────────────────────────┐
+//	│ Parameter         │ Encoding                     │ Why                                  │
+//	├───────────────────┼──────────────────────────────┼──────────────────────────────────────┤
+//	│ srcPrefix         │ Raw bytes (no Comparer       │ This is the literal byte prefix      │
+//	│ dstPrefix         │   encoding, no sentinel).    │ BlockPrefixSubstitution will strip   │
+//	│                   │ Equal-length required.       │ from / replace at the start of every │
+//	│                   │                              │ in-block stored key. It must equal   │
+//	│                   │                              │ exactly the bytes physically present │
+//	│                   │                              │ at the start of stored keys.         │
+//	├───────────────────┼──────────────────────────────┼──────────────────────────────────────┤
+//	│ srcSpan.Start/End │ Comparer-encoded keys (e.g.  │ These are *keys* used in compare     │
+//	│ dstSpan.Start/End │   for CRDB:                  │ operations against SST bounds and    │
+//	│                   │   EngineKey{...}.Encode()).  │ memtable contents; they must be      │
+//	│                   │                              │ well-formed under the active         │
+//	│                   │                              │ Comparer (which may interpret e.g.   │
+//	│                   │                              │ a trailing byte as a suffix length). │
+//	└───────────────────┴──────────────────────────────┴──────────────────────────────────────┘
+//
+// Validation enforced by validateVirtualCloneInputs:
+//
+//   - srcPrefix and dstPrefix are non-empty, distinct, equal-length.
+//   - bytes.HasPrefix(srcSpan.Start, srcPrefix). (srcSpan.End is intentionally
+//     not constrained — the canonical CRDB shape [prefix, prefix.PrefixEnd())
+//     puts End outside the prefix.)
+//   - bytes.HasPrefix(dstSpan.Start, dstPrefix).
+//   - dstSpan.Start == byte-translate(srcSpan.Start, srcPrefix → dstPrefix).
+//     This locks the dst-side lower edge to the substitution image of the
+//     src-side lower edge so cloned bounds (which lie inside dstSpan by
+//     construction) never escape dstSpan on the low side.
+//
+// dstSpan is the destination keyspan that VirtualClone owns: the post-
+// condition is that dstSpan is a snapshot of srcSpan in dst space.
+// VirtualClone atomically excises dstSpan against the live LSM (regardless of
+// what, if anything, is cloned into it) and installs the cloned virtual /
+// physical SSTs in the same VersionEdit. dstSpan.End is caller-provided
+// because Pebble cannot synthesize a Comparer-safe upper bound from a
+// prefix-swap alone (e.g., bytesPrefixEnd of `\xfe\x8c` produces `\xfe\x8d`,
+// which CRDB's cockroachkvs Comparer reads as a 0x8d-byte MVCC suffix on a
+// 2-byte key and panics).
 //
 // Atomicity: a single VersionEdit installs all virtual SSTs and any small
 // physical SSTs produced for boundary-block rewrites. On conflict with a
@@ -51,12 +90,10 @@ const virtualCloneMaxRetries = 5
 // restarts (bounded retry); orphaned boundary SSTs from the failed attempt
 // are cleaned up.
 //
-// Level placement: cloned files are placed top-down, source-floored. Each
-// cloned file is assigned to the deepest level >= its source level whose
-// destination-space bounds don't overlap any existing file at that level.
-// Source files at L0 may be placed at any L0 sublevel down to any deeper
-// level. If even L0 is saturated for a particular cloned file (extreme dst
-// conflict), the operation returns ErrUnsupportedClone.
+// Level placement: cloned files are placed at their source levels. Because
+// dstSpan is excised in the same VE, the dst region is empty at every level
+// before the cloned files install, so source-level placement cannot conflict
+// with any surviving file.
 //
 // Returns ErrUnsupportedClone (with details) for v1 unsupported cases:
 //   - rowblk-format SSTs intersecting srcSpan
@@ -64,9 +101,12 @@ const virtualCloneMaxRetries = 5
 //     [Start, End) interval straddles a srcSpan boundary
 //   - a straddling source SST whose in-span data blocks have a stored
 //     shared prefix shorter than srcPrefix
-//   - destination region is so saturated no level can host a cloned file
 func (d *DB) VirtualClone(
-	ctx context.Context, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
+	ctx context.Context,
+	srcSpan KeyRange,
+	srcPrefix []byte,
+	dstSpan KeyRange,
+	dstPrefix []byte,
 ) error {
 	if err := d.closed.Load(); err != nil {
 		panic(err)
@@ -80,80 +120,172 @@ func (d *DB) VirtualClone(
 			FormatPrefixSubstitution, v,
 		)
 	}
-	if err := validateVirtualCloneInputs(d.opts.Comparer, srcSpan, srcPrefix, dstPrefix); err != nil {
-		return err
-	}
-	dstSpan, err := computeDstSpan(srcSpan, srcPrefix, dstPrefix)
-	if err != nil {
+	if err := validateVirtualCloneInputs(d.opts.Comparer, srcSpan, srcPrefix, dstSpan, dstPrefix); err != nil {
 		return err
 	}
 
+	// Each attempt has two phases:
+	//
+	//   Phase A (no commit-pipeline sem held): snapshot the LSM, walk source
+	//     SSTs, build the cloned plan entries (writing any boundary-block
+	//     physical SSTs to disk).
+	//   Phase B (under commit.AllocateSeqNum): allocate the excise seqnum,
+	//     flush memtables overlapping srcSpan/dstSpan/EFOS-protected ranges,
+	//     and install the version edit (cloned entries + dst-span excise).
+	//
+	// Splitting the phases keeps the read+build work outside the commit
+	// pipeline's serialization so test hooks (and, in principle, anything
+	// else) can issue regular DB writes without deadlocking against the
+	// in-flight allocation.
+	//
+	// On a phase-B abort (a source SST observed in phase A is no longer at
+	// its source level when phase B re-validates), we cleanup any boundary
+	// SSTs phase A wrote and retry. Each retry consumes a fresh excise
+	// seqnum; the abandoned ones leave a small gap in the seqnum sequence,
+	// which is harmless.
 	for attempt := 0; attempt < virtualCloneMaxRetries; attempt++ {
-		retried, err := d.virtualCloneAttempt(ctx, attempt, srcSpan, srcPrefix, dstPrefix, dstSpan)
-		if err != nil {
-			return err
+		entries, preVEObjects, buildErr := d.buildClonePlan(ctx, attempt,
+			srcSpan, srcPrefix, dstSpan, dstPrefix)
+		if buildErr != nil {
+			d.cleanupClonePreVEObjects(preVEObjects)
+			return buildErr
 		}
-		if !retried {
+
+		aborted, installErr := d.installClonePlanViaCommitPipeline(
+			ctx, attempt, entries, srcSpan, dstSpan)
+		if installErr != nil {
+			d.cleanupClonePreVEObjects(preVEObjects)
+			return installErr
+		}
+		if !aborted {
 			return nil
 		}
+		d.cleanupClonePreVEObjects(preVEObjects)
 	}
-	return errors.Newf("pebble: VirtualClone exhausted %d retries due to concurrent LSM mutations",
+	return errors.Newf(
+		"pebble: VirtualClone exhausted %d retries due to concurrent LSM mutations",
 		virtualCloneMaxRetries)
 }
 
-// computeDstSpan returns the dst-prefix-space span derived from srcSpan: the
-// region of dst keys that VirtualClone owns and will excise atomically with
-// the install of any cloned virtual/physical SSTs. The returned span is
-// independent of which (if any) source data falls into srcSpan — the
-// post-condition of VirtualClone is that the dst span is a snapshot of src,
-// and that snapshot is empty when src is empty.
+// installClonePlanViaCommitPipeline runs phase B of one VirtualClone attempt:
+// it allocates the excise seqnum through the commit pipeline, force-flushes
+// memtables that overlap srcSpan/dstSpan/EFOS-protected ranges, and (under
+// the apply callback) installs the cloned entries plus the dstSpan excise.
 //
-// srcSpan.Start is guaranteed by validateVirtualCloneInputs to start with
-// srcPrefix, so dstSpan.Start is a straight bytewise translation. srcSpan.End
-// has two cases:
-//
-//   - It starts with srcPrefix (e.g. srcSpan = [/t/1/k5, /t/1/k9)): translate
-//     bytewise.
-//   - It does not (e.g. srcSpan = [/t/1/, /t/2/)): the caller wants every
-//     key with srcPrefix at or above srcSpan.Start cloned, so the
-//     corresponding dst region is everything with dstPrefix at or above
-//     dstSpan.Start. We close that with bytesPrefixEnd(dstPrefix), the
-//     smallest byte string strictly greater than every byte string starting
-//     with dstPrefix.
-func computeDstSpan(srcSpan KeyRange, srcPrefix, dstPrefix []byte) (KeyRange, error) {
-	start := translateUserKey(srcPrefix, dstPrefix, srcSpan.Start)
-	var end []byte
-	if bytes.HasPrefix(srcSpan.End, srcPrefix) {
-		end = translateUserKey(srcPrefix, dstPrefix, srcSpan.End)
-	} else {
-		end = bytesPrefixEnd(dstPrefix)
-		if end == nil {
-			return KeyRange{}, errors.Newf(
-				"pebble: VirtualClone cannot derive dst excise span: dstPrefix %q has no representable bytes-prefix successor",
-				dstPrefix)
+// The allocated seqnum is registered in ongoingExcises so any EFOS created
+// while phase B is in flight observes a visibleSeqNum past the excise
+// (preserving its pre-excise view); the registration is cleared after
+// AllocateSeqNum returns. Mirrors the ingest+excise pattern in DB.ingest.
+func (d *DB) installClonePlanViaCommitPipeline(
+	ctx context.Context,
+	attempt int,
+	entries []clonePlanEntry,
+	srcSpan, dstSpan KeyRange,
+) (aborted bool, _ error) {
+	var (
+		prepareErr     error
+		installErr     error
+		assignedSeqNum base.SeqNum
+		mem            *flushableEntry
+		mut            *memTable
+	)
+	prepare := func(seqNum base.SeqNum) {
+		assignedSeqNum = seqNum
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if _, ok := d.mu.snapshots.ongoingExcises[seqNum]; ok {
+			panic(errors.AssertionFailedf("pebble: VirtualClone excise with seqnum %s already in map", seqNum))
+		}
+		d.mu.snapshots.ongoingExcises[seqNum] = dstSpan
+
+		overlapBounds := []bounded{&srcSpan, &dstSpan}
+		overlapBounds = append(overlapBounds,
+			exciseOverlapBounds(d.cmp, &d.mu.snapshots.snapshotList, dstSpan, seqNum)...)
+
+		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
+			m := d.mu.mem.queue[i]
+			var anyOverlaps bool
+			m.computePossibleOverlaps(func(b bounded) shouldContinue {
+				anyOverlaps = true
+				return stopIteration
+			}, overlapBounds...)
+			if !anyOverlaps {
+				continue
+			}
+			if mem == nil {
+				mem = m
+			}
+			if m.flushable == d.mu.mem.mutable {
+				if err := d.makeRoomForWrite(nil); err != nil {
+					prepareErr = err
+					return
+				}
+			}
+			m.flushForced = true
+		}
+		if mem == nil {
+			// No overlap; ref the mutable memtable as a writer to prevent
+			// it (and any later memtables) from flushing before the apply
+			// installs the excise. Mirrors ingest.go's mut handling.
+			mut = d.mu.mem.mutable
+			mut.writerRef()
+		} else {
+			d.maybeScheduleFlush()
 		}
 	}
-	return KeyRange{Start: start, End: end}, nil
+	apply := func(seqNum base.SeqNum) {
+		defer func() {
+			if mut != nil && mut.writerUnref() {
+				d.mu.Lock()
+				d.maybeScheduleFlush()
+				d.mu.Unlock()
+			}
+		}()
+		if prepareErr != nil {
+			installErr = prepareErr
+			return
+		}
+		if mem != nil {
+			// The phase-A build ran on a snapshot taken before this flush
+			// completed, so the freshly-flushed memtable contents are not
+			// reflected in `entries`. Wait for the flush to land, then
+			// abort: the next iteration's phase A will snapshot the post-
+			// flush LSM and pick up the flushed SSTs. Steady-state cost is
+			// at most one extra retry per VirtualClone call.
+			select {
+			case <-mem.flushed:
+			case <-ctx.Done():
+				installErr = ctx.Err()
+				return
+			}
+			aborted = true
+			return
+		}
+		a, err := d.installClonePlan(ctx, attempt, entries, dstSpan, seqNum)
+		aborted = a
+		installErr = err
+	}
+	d.commit.AllocateSeqNum(1, prepare, apply)
+	// NB: removeFromOngoingExcises must happen after AllocateSeqNum returns
+	// (i.e. after the assigned seqnum has been published as visible), so
+	// that any concurrent EFOS creation that grabs DB.mu after the removal
+	// observes a visibleSeqNum past our excise. Mirrors ingest.go:2042-2048.
+	d.removeFromOngoingExcises(assignedSeqNum)
+	return aborted, installErr
 }
 
-// bytesPrefixEnd returns the smallest byte string strictly greater than every
-// byte string having `prefix` as a bytes-prefix. It increments the last
-// non-0xff byte and truncates trailing 0xff bytes. Returns nil if `prefix` is
-// empty or consists entirely of 0xff bytes (no representable upper bound).
-func bytesPrefixEnd(prefix []byte) []byte {
-	end := append([]byte(nil), prefix...)
-	for i := len(end) - 1; i >= 0; i-- {
-		if end[i] < 0xff {
-			end[i]++
-			return end[:i+1]
-		}
+// cleanupClonePreVEObjects removes physical SSTs that a clone attempt wrote
+// before its version edit applied. Used on abort/retry and on terminal errors
+// to avoid leaving orphaned boundary-block files in the object provider.
+func (d *DB) cleanupClonePreVEObjects(preVEObjects []base.DiskFileNum) {
+	for _, fn := range preVEObjects {
+		_ = d.objProvider.Remove(base.FileTypeTable, fn)
 	}
-	return nil
 }
 
 // validateVirtualCloneInputs checks the static preconditions of VirtualClone.
 func validateVirtualCloneInputs(
-	cmp *base.Comparer, srcSpan KeyRange, srcPrefix, dstPrefix []byte,
+	cmp *base.Comparer, srcSpan KeyRange, srcPrefix []byte, dstSpan KeyRange, dstPrefix []byte,
 ) error {
 	if len(srcPrefix) == 0 {
 		return errors.New("pebble: VirtualClone requires a non-empty srcPrefix")
@@ -202,6 +334,30 @@ func validateVirtualCloneInputs(
 			"pebble: VirtualClone srcSpan start %q does not have srcPrefix %q",
 			srcSpan.Start, srcPrefix)
 	}
+	if !dstSpan.Valid() {
+		return errors.New("pebble: VirtualClone requires a valid dstSpan")
+	}
+	if cmp.Compare(dstSpan.Start, dstSpan.End) >= 0 {
+		return errors.Newf("pebble: VirtualClone dstSpan start %q is not before end %q",
+			dstSpan.Start, dstSpan.End)
+	}
+	if !bytes.HasPrefix(dstSpan.Start, dstPrefix) {
+		return errors.Newf(
+			"pebble: VirtualClone dstSpan start %q does not have dstPrefix %q",
+			dstSpan.Start, dstPrefix)
+	}
+	// dstSpan.Start must be the bytewise translation of srcSpan.Start under
+	// the srcPrefix→dstPrefix substitution. This is the same translation that
+	// the cloned virtual SSTs apply to source keys, so making the excised
+	// region's lower edge match keeps the cloned bounds inside dstSpan.
+	expectedDstStart := make([]byte, 0, len(dstPrefix)+len(srcSpan.Start)-len(srcPrefix))
+	expectedDstStart = append(expectedDstStart, dstPrefix...)
+	expectedDstStart = append(expectedDstStart, srcSpan.Start[len(srcPrefix):]...)
+	if !bytes.Equal(dstSpan.Start, expectedDstStart) {
+		return errors.Newf(
+			"pebble: VirtualClone dstSpan start %q does not match srcSpan start %q translated under srcPrefix→dstPrefix (expected %q)",
+			dstSpan.Start, srcSpan.Start, expectedDstStart)
+	}
 	return nil
 }
 
@@ -227,42 +383,81 @@ func translateInternalKey(srcPrefix, dstPrefix []byte, k base.InternalKey) base.
 	}
 }
 
+// translateBoundaryUserKey is like translateUserKey but additionally maps
+// the special case key == srcSpan.End to dstSpan.End. This is needed for
+// fragment bounds that have been truncated to srcSpan: a rangedel/rangekey
+// fragment originally spanning [A, B) where B > srcSpan.End is truncated
+// to [max(A, srcSpan.Start), srcSpan.End). The truncated end key srcSpan.End
+// generally does NOT have srcPrefix as a bytes-prefix (e.g. when the caller
+// asks to clone all of srcPrefix and passes srcSpan.End as the upper bound
+// of srcPrefix's keyspace), so a bytewise srcPrefix→dstPrefix substitution
+// would be ill-defined. The dst-space analog of srcSpan.End is dstSpan.End,
+// which the caller has supplied via the API.
+func translateBoundaryUserKey(
+	srcPrefix, dstPrefix []byte, srcSpan, dstSpan KeyRange, key []byte,
+) []byte {
+	if bytes.Equal(key, srcSpan.End) {
+		return append([]byte(nil), dstSpan.End...)
+	}
+	return translateUserKey(srcPrefix, dstPrefix, key)
+}
+
+// translateBoundaryInternalKey is the InternalKey form of translateBoundaryUserKey.
+func translateBoundaryInternalKey(
+	srcPrefix, dstPrefix []byte, srcSpan, dstSpan KeyRange, k base.InternalKey,
+) base.InternalKey {
+	return base.InternalKey{
+		UserKey: translateBoundaryUserKey(srcPrefix, dstPrefix, srcSpan, dstSpan, k.UserKey),
+		Trailer: k.Trailer,
+	}
+}
+
 // clonePlanEntry describes one cloned file (virtual or physical) to install.
 type clonePlanEntry struct {
 	// sourceLevel is the level of the originating source SST (the floor for
 	// destination-level placement).
 	sourceLevel int
-	// source is the source TableMetadata (only set for virtual entries; nil
-	// for boundary-block physical entries).
+	// source is the source TableMetadata. Always set for entries derived from
+	// a single source SST (data-run virtual, boundary-rewrite physical,
+	// fragment-rewrite physical). Used for source-level/backing bookkeeping
+	// and for grouping entries when forceL0 placement of one entry must
+	// propagate to its siblings.
 	source *manifest.TableMetadata
 	// virtual is the virtual TableMetadata to install. Mutually exclusive with
 	// physical.
 	virtual *manifest.TableMetadata
 	// physical is the physical TableMetadata to install (boundary-block
-	// rewrite). Mutually exclusive with virtual.
+	// rewrite or fragment-rewrite). Mutually exclusive with virtual. Physical
+	// entries are self-contained: they have their own backing initialized by
+	// InitPhysicalBacking and do not share the source's backing.
 	physical *manifest.TableMetadata
 	// assignedLevel is the level chosen by placeClonedFiles. -1 if not yet
 	// assigned.
 	assignedLevel int
+	// forceL0 places this entry at L0 regardless of its source's level. Used
+	// for fragment-rewrite physical SSTs whose bounds (the truncated extent
+	// of a wide range deletion or range key) may overlap the cloned virtual
+	// SST's data-run bounds and the boundary-rewrite physical SSTs at the
+	// source level. L0 admits overlapping files via sublevels.
+	forceL0 bool
 }
 
-// virtualCloneAttempt performs one attempt at VirtualClone.
-func (d *DB) virtualCloneAttempt(
-	ctx context.Context, attempt int, srcSpan KeyRange, srcPrefix, dstPrefix []byte, dstSpan KeyRange,
-) (retried bool, _ error) {
-	// Before snapshotting the version, check whether any memtable contains
-	// keys overlapping srcSpan or dstSpan. If so, force a flush and wait for
-	// it before proceeding. The src wait is required because recent writes to
-	// keys in srcSpan that haven't yet flushed would otherwise be silently
-	// absent from the cloned destination. The dst wait is required because
-	// VirtualClone atomically excises dstSpan; unflushed writes to dstSpan
-	// would silently survive the excise. This mirrors the pattern used by
-	// DB.Compact (db.go:1810-1859) and the memtable-overlap handling in
-	// DB.ingest (ingest.go:1863-1962).
-	if retried, err := d.flushMemtablesOverlappingClone(ctx, srcSpan, dstSpan); err != nil || retried {
-		return retried, err
-	}
-
+// buildClonePlan handles phase A of one VirtualClone attempt: snapshot the
+// LSM, walk source SSTs intersecting srcSpan, validate fragments, and build
+// the cloned plan entries (including writing any boundary-block physical
+// SSTs to disk). Runs without holding the commit pipeline semaphore so test
+// hooks (and concurrent operations more generally) may freely commit.
+//
+// On any error, returned preVEObjects identifies any boundary SSTs already
+// written that the caller must remove from the object provider.
+func (d *DB) buildClonePlan(
+	ctx context.Context,
+	attempt int,
+	srcSpan KeyRange,
+	srcPrefix []byte,
+	dstSpan KeyRange,
+	dstPrefix []byte,
+) (entries []clonePlanEntry, preVEObjects []base.DiskFileNum, _ error) {
 	d.mu.Lock()
 	currentVersion := d.mu.versions.currentVersion()
 	currentVersion.Ref()
@@ -278,7 +473,7 @@ func (d *DB) virtualCloneAttempt(
 
 	srcSpanBounds := srcSpan.UserKeyBounds()
 
-	// Shared blob value fetcher for the lifetime of this attempt. Used by
+	// Shared blob value fetcher for the lifetime of this build. Used by
 	// boundary-block reads (and any other block-level helper) to materialize
 	// values whose handles point into blob files. Per-source TableBlobContexts
 	// constructed downstream wire this fetcher together with the source
@@ -288,19 +483,6 @@ func (d *DB) virtualCloneAttempt(
 		block.ReadEnv{}, blob.SuggestedCachedReaders(currentVersion.MaxReadAmp()))
 	defer func() { _ = blobFetcher.Close() }()
 
-	// Track physical SSTs we wrote pre-VE. On any failure path (retry,
-	// terminal error) before the VE applies, we must remove them from the
-	// object provider to avoid orphan files. Mirrors ingest.go's
-	// ingestCleanup pattern (ingest.go:834).
-	var preVEObjects []base.DiskFileNum
-	cleanupPreVE := func() {
-		for _, fn := range preVEObjects {
-			_ = d.objProvider.Remove(base.FileTypeTable, fn)
-		}
-		preVEObjects = nil
-	}
-
-	var entries []clonePlanEntry
 	// Walk LSM in source-level order (L0 sublevels first, then L1..L6),
 	// collecting cloned entries.
 	for layer, ls := range currentVersion.AllLevelsAndSublevels() {
@@ -315,25 +497,32 @@ func (d *DB) virtualCloneAttempt(
 			// the cloned virtual SST's bounds.
 			survey, err := d.surveyAndValidateFragments(ctx, m, srcSpan, level)
 			if err != nil {
-				cleanupPreVE()
-				return false, err
+				return nil, preVEObjects, err
 			}
+			// Fully-contained source SSTs go through buildFullyContainedVirtual,
+			// which uses BlockPrefixSubstitution to expose every key under
+			// dstPrefix. The substitution requires every stored user key to
+			// have srcPrefix as its leading bytes — including the SST's
+			// metadata bounds (smallest/largest), which `buildFullyContainedVirtual`
+			// translates verbatim. A subtle case: an SST whose Largest is an
+			// exclusive sentinel exactly at srcSpan.End (e.g., a range-del
+			// fragment ending at /Tenant/4 when srcSpan.End = /Tenant/4)
+			// satisfies `srcSpanBounds.ContainsInternalKey` (the exclusive-
+			// sentinel rule treats key.UserKey == End.Key as inside when the
+			// trailer is an exclusive sentinel) but its Largest.UserKey does
+			// NOT have srcPrefix. Treating such an SST as fully-contained and
+			// substituting verbatim would corrupt the bounds. Routing it to
+			// the straddler path lets `rewriteStraddlerFragments` clip the
+			// rangedel to srcSpan and translate via the boundary mapping
+			// (srcSpan.End → dstSpan.End), which is the correct shape.
 			fullyContained := srcSpanBounds.ContainsInternalKey(d.cmp, m.Smallest()) &&
-				srcSpanBounds.ContainsInternalKey(d.cmp, m.Largest())
+				srcSpanBounds.ContainsInternalKey(d.cmp, m.Largest()) &&
+				bytes.HasPrefix(m.Smallest().UserKey, srcPrefix) &&
+				bytes.HasPrefix(m.Largest().UserKey, srcPrefix)
 			if fullyContained {
-				if !bytes.HasPrefix(m.Smallest().UserKey, srcPrefix) ||
-					!bytes.HasPrefix(m.Largest().UserKey, srcPrefix) {
-					cleanupPreVE()
-					return false, errors.Wrapf(ErrUnsupportedClone,
-						"source table %s at L%d has bounds outside srcPrefix %q (smallest=%s largest=%s)",
-						m.TableNum, level, srcPrefix,
-						m.Smallest().Pretty(d.opts.Comparer.FormatKey),
-						m.Largest().Pretty(d.opts.Comparer.FormatKey))
-				}
 				vm, err := d.buildFullyContainedVirtual(m, srcPrefix, dstPrefix)
 				if err != nil {
-					cleanupPreVE()
-					return false, err
+					return nil, preVEObjects, err
 				}
 				entries = append(entries, clonePlanEntry{
 					sourceLevel:   level,
@@ -347,49 +536,87 @@ func (d *DB) virtualCloneAttempt(
 			// build a block-aligned virtual TableMetadata + 0-2 boundary
 			// physical SSTs.
 			straddlerEntries, written, err := d.buildStraddlerEntries(
-				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstPrefix, survey, &blobFetcher)
-			if err != nil {
-				// Track any objects already written before propagating.
-				preVEObjects = append(preVEObjects, written...)
-				cleanupPreVE()
-				return false, err
-			}
+				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstSpan, dstPrefix, survey, &blobFetcher)
 			preVEObjects = append(preVEObjects, written...)
+			if err != nil {
+				return nil, preVEObjects, err
+			}
 			entries = append(entries, straddlerEntries...)
 		}
 	}
 
-	dstSpanBounds := dstSpan.UserKeyBounds()
+	// A source SST whose bounds extend into dstSpan (a single physical file
+	// covering both src-prefix and dst-prefix keys — common after a snapshot
+	// receive into a region neighboring an existing tenant) is handled by
+	// deferring its stand-in / DeletedTables / CreatedBackingTables to the
+	// phase-B dst-excise loop. exciseTable + applyExciseToVersionEdit will
+	// trim the file at dstSpan.Start, producing a virtual leftTable that
+	// covers the surviving src-side region — which IS the stand-in for
+	// those files. The cloned-virtual / boundary-rewrite entries this phase
+	// builds for the in-srcSpan data are unaffected (they live in dst space
+	// and don't overlap the leftTable). See installClonePlan for the skip
+	// logic that avoids the otherwise-conflicting double install.
 
-	// Source/destination keyspan disjointness: VirtualClone owns dstSpan and
-	// will excise it. If a source SST's bounds extend into dstSpan, the same
-	// physical file would be touched by both the source-stand-in path and the
-	// dst-excise path (producing conflicting DeletedTables entries). This is a
-	// pathological layout (a single SST spanning both src-prefix and dst-prefix
-	// keys); reject it as ErrUnsupportedClone.
-	for _, e := range entries {
-		if e.source == nil {
+	// Each cloned entry is placed at its source level (after dst-excise wipes
+	// dstSpan, no surviving file can conflict). Fragment-rewrite physical
+	// SSTs (forceL0) go to L0 instead: their bounds — the truncated extent
+	// of a wide range deletion or range key — typically encompass the data-
+	// run virtual SST and any boundary-rewrite physical SSTs from the same
+	// source, and L0's sublevel structure tolerates that overlap whereas
+	// L1+ does not.
+	//
+	// When a source produces a forceL0 fragment-rewrite SST, ALL other
+	// entries from that same source (the in-span data run virtual, any
+	// boundary-rewrite physicals) are also forced to L0. Reason: the cloned
+	// data SST gets its trailers bumped to exciseSeqNum (via SyntheticSeqNum)
+	// in installClonePlan, but the fragment-rewrite SST keeps its source
+	// rangedel seqnums (which may be lower). Splitting the cloned data to a
+	// lower level (e.g., L6) than the rangedel (L0) violates the LSM
+	// invariant that higher levels carry newer seqnums; the merging iter's
+	// seek-past-tombstone optimization (merging_iter.go:639) doesn't check
+	// seqnums for higher-level tombstones — it assumes the LSM invariant —
+	// and would seek the cloned data iterator past the tombstone end,
+	// silently eliding the cloned data. Co-locating all entries from a
+	// single source in L0 lets sublevel placement (sorted by LargestSeqNum)
+	// put the cloned data SST in a NEWER sublevel (lower mergingIter index)
+	// than the rangedel SST, so the seek-past loop never visits the rangedel
+	// when the data item is heap top.
+	sourcesWithForceL0 := make(map[base.TableNum]struct{})
+	for i := range entries {
+		if entries[i].forceL0 && entries[i].source != nil {
+			sourcesWithForceL0[entries[i].source.TableNum] = struct{}{}
+		}
+	}
+	for i := range entries {
+		if entries[i].forceL0 {
+			entries[i].assignedLevel = 0
 			continue
 		}
-		if dstSpanBounds.Overlaps(d.cmp, e.source.UserKeyBounds()) {
-			cleanupPreVE()
-			return false, errors.Wrapf(ErrUnsupportedClone,
-				"source table %s at L%d has bounds overlapping the dst excise span (smallest=%s largest=%s)",
-				e.source.TableNum, e.sourceLevel,
-				e.source.Smallest().Pretty(d.opts.Comparer.FormatKey),
-				e.source.Largest().Pretty(d.opts.Comparer.FormatKey))
+		if entries[i].source != nil {
+			if _, ok := sourcesWithForceL0[entries[i].source.TableNum]; ok {
+				entries[i].assignedLevel = 0
+				continue
+			}
 		}
-	}
-
-	// Each cloned entry is placed at its source level. After dst excise,
-	// dstSpan is empty at every level, so cloned-file bounds (which lie within
-	// dstSpan) cannot overlap any surviving file at any level. Within a single
-	// source level, two cloned files originate from non-overlapping source
-	// SSTs (LSM invariant) and so their dst-translated bounds also don't
-	// overlap.
-	for i := range entries {
 		entries[i].assignedLevel = entries[i].sourceLevel
 	}
+	return entries, preVEObjects, nil
+}
+
+// installClonePlan handles phase B of one VirtualClone attempt: re-validates
+// the plan against the live version (aborts if any source SST has moved out
+// from under the snapshot) and installs the version edit containing all
+// cloned entries plus the dstSpan excise. Called from inside the apply
+// callback of commit.AllocateSeqNum so the excise carries a properly-ordered
+// seqnum.
+func (d *DB) installClonePlan(
+	ctx context.Context,
+	attempt int,
+	entries []clonePlanEntry,
+	dstSpan KeyRange,
+	exciseSeqNum base.SeqNum,
+) (aborted bool, _ error) {
+	dstSpanBounds := dstSpan.UserKeyBounds()
 
 	// Test hook: invoked just before re-acquiring d.mu and applying the
 	// version edit.
@@ -397,12 +624,10 @@ func (d *DB) virtualCloneAttempt(
 		hook(attempt)
 	}
 
-	// Apply via UpdateVersionLocked.
 	d.mu.Lock()
 	jobID := d.newJobIDLocked()
 	defer d.mu.Unlock()
 
-	var aborted bool
 	_, err := d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
 		current := d.mu.versions.currentVersion()
 
@@ -432,20 +657,58 @@ func (d *DB) virtualCloneAttempt(
 			if meta == nil {
 				meta = e.physical
 			}
+			// Bump the cloned point-data SST's effective seqnum to the excise
+			// seqnum (allocated by AllocateSeqNum, post-dates all source data).
+			// Without this, source-backing data whose key trailers were
+			// snap-zeroed at compaction time (e.g. for an L6 SST below the
+			// earliest snapshot) ends up in dst at trailer seqnum 0, where any
+			// rangedel at the same seqnum (kind ordering: DEL > SET) shadows
+			// it on read. We bump only the cloned point-data SSTs (cloned
+			// virtual + boundary-rewrite physicals), NOT the fragment-rewrite
+			// physical (e.forceL0): the fragment rewrite preserves source
+			// rangedel seqnums so cloned data sits ABOVE cloned tombstones.
+			// SyntheticSeqNum activates when SeqNums.Low == SeqNums.High.
+			if !e.forceL0 {
+				meta.SeqNums = base.SeqNumRange{Low: exciseSeqNum, High: exciseSeqNum}
+				if meta.LargestSeqNumAbsolute < exciseSeqNum {
+					meta.LargestSeqNumAbsolute = exciseSeqNum
+				}
+			}
 			ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
 				Level: e.assignedLevel,
 				Meta:  meta,
 			})
+			if e.physical != nil {
+				// Boundary-rewrite and fragment-rewrite physical SSTs are
+				// self-contained: they have a fresh backing initialized by
+				// InitPhysicalBacking and no source-backing sharing to
+				// arrange. (e.source is still set on these entries — used
+				// only for forceL0 sibling-grouping in placeClonedFiles.)
+				continue
+			}
 			if e.source == nil {
-				// Boundary-rewrite physical SSTs are self-contained: they
-				// have a fresh backing initialized by InitPhysicalBacking and
-				// no source-backing sharing to arrange.
 				continue
 			}
 			if _, ok := seenSource[e.source.TableNum]; ok {
 				continue
 			}
 			seenSource[e.source.TableNum] = struct{}{}
+
+			// If this source SST's bounds extend into dstSpan, the dst-excise
+			// loop below will run exciseTable on it and produce a virtual
+			// leftTable over the same backing — which IS the stand-in for
+			// the surviving src-side region — and applyExciseToVersionEdit
+			// will add the file to DeletedTables and (if physical) append
+			// its backing to CreatedBackingTables. Skip the equivalent work
+			// here so we don't install a duplicate stand-in or double-add
+			// CreatedBackingTables (the manifest invariant requires at most
+			// one CreatedBackingTables entry per backing). The cloned
+			// virtual SSTs / boundary rewrites we already appended above
+			// are unaffected: they live in dst space and don't overlap
+			// the leftTable.
+			if dstSpanBounds.Overlaps(d.cmp, e.source.UserKeyBounds()) {
+				continue
+			}
 
 			// Source-backing sharing. The cloned virtual SST(s) we emit
 			// AttachVirtualBacking(source.TableBacking), so the manifest must
@@ -513,13 +776,6 @@ func (d *DB) virtualCloneAttempt(
 		// have srcPrefix bounds and so cannot overlap dstSpan; the
 		// pre-flight check above already rejected the pathological case of
 		// a single source SST whose bounds extend into dstSpan.
-		//
-		// TODO: thread an excise sequence number allocated via the commit
-		// pipeline so concurrent EFOS protected ranges over dstSpan are
-		// honored. For now we record the current logSeqNum as a best-effort
-		// marker; the dst-tenant-clone use case (which assumes dst is empty
-		// and not under concurrent access) does not exercise EFOS overlap.
-		exciseSeqNum := d.mu.versions.logSeqNum.Load()
 		var anyExcised bool
 		for layer, ls := range current.AllLevelsAndSublevels() {
 			for m := range ls.Overlaps(d.cmp, dstSpanBounds).All() {
@@ -575,78 +831,13 @@ func (d *DB) virtualCloneAttempt(
 		}, nil
 	})
 	if err != nil {
-		cleanupPreVE()
 		return false, err
 	}
 	if aborted {
-		cleanupPreVE()
 		return true, nil
 	}
 	d.updateReadStateLocked(d.opts.DebugCheck)
 	return false, nil
-}
-
-// flushMemtablesOverlappingClone walks d.mu.mem.queue and forces a flush of
-// the newest memtable whose contents overlap srcSpan or dstSpan, waiting for
-// the flush to complete before returning. The returned retried bool is true
-// when a flush was forced (signalling the caller to start a fresh attempt
-// with a fresh version snapshot).
-//
-// This mirrors the memtable-overlap pattern in DB.Compact (db.go:1810-1859):
-// walk the queue from newest to oldest, find the newest overlapping
-// memtable, force a rotation if it's the mutable one, schedule a flush, and
-// then wait on the flushed channel.
-func (d *DB) flushMemtablesOverlappingClone(
-	ctx context.Context, srcSpan, dstSpan KeyRange,
-) (retried bool, _ error) {
-	d.mu.Lock()
-	mem, err := func() (*flushableEntry, error) {
-		// Walk from newest (mutable) to oldest. We only need to wait on the
-		// newest overlapping memtable; once it (and any older ones already
-		// scheduled to flush) finishes, all of those keys are in L0.
-		for i := len(d.mu.mem.queue) - 1; i >= 0; i-- {
-			mem := d.mu.mem.queue[i]
-			var anyOverlaps bool
-			mem.computePossibleOverlaps(func(b bounded) shouldContinue {
-				anyOverlaps = true
-				return stopIteration
-			}, srcSpan, dstSpan)
-			if !anyOverlaps {
-				continue
-			}
-			var err error
-			if mem.flushable == d.mu.mem.mutable {
-				// We must hold both commitPipeline.mu and DB.mu when calling
-				// makeRoomForWrite. Lock order forces us to release DB.mu so
-				// we can grab commit.mu first.
-				d.mu.Unlock()
-				d.commit.mu.Lock()
-				d.mu.Lock()
-				defer d.commit.mu.Unlock() //nolint:deferloop
-				if mem.flushable == d.mu.mem.mutable {
-					err = d.makeRoomForWrite(nil)
-				}
-			}
-			mem.flushForced = true
-			d.maybeScheduleFlush()
-			return mem, err
-		}
-		return nil, nil
-	}()
-	d.mu.Unlock()
-
-	if err != nil {
-		return false, err
-	}
-	if mem == nil {
-		return false, nil
-	}
-	select {
-	case <-mem.flushed:
-	case <-ctx.Done():
-		return false, ctx.Err()
-	}
-	return true, nil
 }
 
 // buildSourceStandIn produces a virtual TableMetadata that covers the full
@@ -771,7 +962,9 @@ func (d *DB) buildStraddlerEntries(
 	level int,
 	srcSpan KeyRange,
 	srcSpanBounds base.UserKeyBounds,
-	srcPrefix, dstPrefix []byte,
+	srcPrefix []byte,
+	dstSpan KeyRange,
+	dstPrefix []byte,
 	survey fragmentSurvey,
 	blobFetcher *blob.ValueFetcher,
 ) (entries []clonePlanEntry, written []base.DiskFileNum, _ error) {
@@ -824,8 +1017,30 @@ func (d *DB) buildStraddlerEntries(
 			"source table %s at L%d uses the row-based block format", m.TableNum, level)
 	}
 	if len(blocks) == 0 {
-		return nil, nil, errors.AssertionFailedf(
-			"pebble: VirtualClone source table %s has no data blocks", m.TableNum)
+		// Pebble's flush may drop SET keys obsoleted by a same-batch
+		// RANGEDEL with a higher seqnum, producing an SST whose only
+		// content is the rangedel block (no data blocks). Such a source
+		// has no in-span point keys to clone; the only thing to materialize
+		// is the in-srcSpan portion of its fragments. Fall through to the
+		// fragment-rewrite path below.
+		if survey.hasInSpanRangeDel || survey.hasInSpanRangeKey {
+			fragMeta, fragFileNum, fragErr := d.rewriteStraddlerFragments(
+				ctx, m, srcSpan, srcPrefix, dstSpan, dstPrefix, level)
+			if fragErr != nil {
+				return entries, written, fragErr
+			}
+			if fragMeta != nil {
+				written = append(written, fragFileNum)
+				entries = append(entries, clonePlanEntry{
+					sourceLevel:   level,
+					source:        m,
+					physical:      fragMeta,
+					assignedLevel: -1,
+					forceL0:       true,
+				})
+			}
+		}
+		return entries, written, nil
 	}
 
 	// Classify each block by its key range relative to srcSpan. A block's
@@ -952,22 +1167,13 @@ func (d *DB) buildStraddlerEntries(
 			},
 		}
 		vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
-		// Extend the virtual SST's point-key bounds to include any in-span
-		// range deletions (which are tracked under point keys), and set its
-		// range-key bounds for any in-span range keys. The fragments are
-		// surfaced via NewRawRangeDelIter / NewRawRangeKeyIter on the virtual
-		// reader, with bounds-truncation against the virtual SST's bounds; so
-		// the bounds must encompass every fragment that should be visible.
-		if survey.hasInSpanRangeDel {
-			vm.ExtendPointKeyBounds(d.cmp,
-				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeDel),
-				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeDel))
-		}
-		if survey.hasInSpanRangeKey {
-			vm.ExtendRangeKeyBounds(d.cmp, survey.rangeKeyKinds,
-				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeKey),
-				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeKey))
-		}
+		// NB: do NOT extend the virtual SST's bounds to encompass in-span
+		// range-deletion / range-key fragments. A wide rangedel can produce
+		// bounds that overlap the boundary-rewrite physical SSTs from this
+		// same source (and the cloned virtual SST + boundary SSTs all live
+		// at the source level, where pebble forbids overlapping files).
+		// In-span fragments are materialized into a separate physical SST by
+		// rewriteStraddlerFragments and placed at L0; see below.
 
 		vm.AttachVirtualBacking(m.TableBacking)
 		// Approximate size by proportion of in-span blocks to total blocks.
@@ -993,47 +1199,26 @@ func (d *DB) buildStraddlerEntries(
 			virtual:       vm,
 			assignedLevel: -1,
 		})
-	} else if survey.hasInSpanRangeDel || survey.hasInSpanRangeKey {
-		// No in-span data block run, but the source has range deletions or
-		// range keys whose bounds lie within srcSpan. Build a virtual SST
-		// whose bounds cover only those fragments (in dst space). Point keys
-		// from the boundary blocks (if any) are exposed via the boundary
-		// physical SSTs; this virtual entry only surfaces fragments.
-		vm := &manifest.TableMetadata{
-			Virtual:               true,
-			TableNum:              d.mu.versions.getNextTableNum(),
-			SeqNums:               m.SeqNums,
-			LargestSeqNumAbsolute: m.LargestSeqNumAbsolute,
-			BlobReferenceDepth:    m.BlobReferenceDepth,
-			BlockPrefixSubstitution: sstable.BlockPrefixSubstitution{
-				Src: append([]byte(nil), srcPrefix...),
-				Dst: append([]byte(nil), dstPrefix...),
-			},
+	}
+	// In-span fragments (range-del / range-key) are materialized into a
+	// separate physical SST and placed at L0. See rewriteStraddlerFragments
+	// for the rationale.
+	if survey.hasInSpanRangeDel || survey.hasInSpanRangeKey {
+		fragMeta, fragFileNum, err := d.rewriteStraddlerFragments(
+			ctx, m, srcSpan, srcPrefix, dstSpan, dstPrefix, level)
+		if err != nil {
+			return entries, written, err
 		}
-		if survey.hasInSpanRangeDel {
-			vm.ExtendPointKeyBounds(d.cmp,
-				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeDel),
-				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeDel))
+		if fragMeta != nil {
+			written = append(written, fragFileNum)
+			entries = append(entries, clonePlanEntry{
+				sourceLevel:   level,
+				source:        m,
+				physical:      fragMeta,
+				assignedLevel: -1,
+				forceL0:       true,
+			})
 		}
-		if survey.hasInSpanRangeKey {
-			vm.ExtendRangeKeyBounds(d.cmp, survey.rangeKeyKinds,
-				translateInternalKey(srcPrefix, dstPrefix, survey.smallestRangeKey),
-				translateInternalKey(srcPrefix, dstPrefix, survey.largestRangeKey))
-		}
-		vm.AttachVirtualBacking(m.TableBacking)
-		vm.Size = 1
-		determineExcisedTableBlobReferences(m.BlobReferences, m.Size, vm, d.FormatMajorVersion())
-		if err := vm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
-			return nil, nil, errors.Wrapf(err,
-				"pebble: VirtualClone produced invalid virtual table for source %s", m.TableNum)
-		}
-		vm.ValidateVirtual(m)
-		entries = append(entries, clonePlanEntry{
-			sourceLevel:   level,
-			source:        m,
-			virtual:       vm,
-			assignedLevel: -1,
-		})
 	}
 
 	// Boundary-block rewrites.
@@ -1059,6 +1244,7 @@ func (d *DB) buildStraddlerEntries(
 		written = append(written, fileNum)
 		entries = append(entries, clonePlanEntry{
 			sourceLevel:   level,
+			source:        m,
 			physical:      physical,
 			assignedLevel: -1,
 		})
@@ -1124,10 +1310,17 @@ func (d *DB) surveyAndValidateFragments(
 ) (fragmentSurvey, error) {
 	cmp := d.cmp
 	var survey fragmentSurvey
+	// walk iterates the fragments in iter, classifies each relative to srcSpan,
+	// and updates the survey for any fragment that has any overlap with
+	// srcSpan. The survey records the bounds of the in-span (clipped-to-
+	// srcSpan) fragment extents in src space — used by callers to decide
+	// whether to materialize a fragment-rewrite physical SST and to
+	// short-circuit when no in-span fragments exist. Straddlers are not
+	// rejected; the caller is responsible for materializing the truncated
+	// (in-srcSpan) portion via rewriteStraddlerFragments.
 	walk := func(
-		kind string,
 		iter keyspan.FragmentIterator,
-		recordInSpan func(s *keyspan.Span),
+		updateBounds func(effSmallest, effLargest base.InternalKey, kind base.InternalKeyKind, trailer base.InternalKeyTrailer),
 	) error {
 		if iter == nil {
 			return nil
@@ -1136,32 +1329,32 @@ func (d *DB) surveyAndValidateFragments(
 		for s, err := iter.First(); s != nil || err != nil; s, err = iter.Next() {
 			if err != nil {
 				return errors.Wrapf(err,
-					"pebble: VirtualClone failed iterating %s of source table %s",
-					kind, m.TableNum)
+					"pebble: VirtualClone failed iterating fragments of source table %s",
+					m.TableNum)
 			}
-			// Classify the fragment relative to srcSpan = [Start, End).
-			//   fully-outside: s.End <= srcSpan.Start  OR  s.Start >= srcSpan.End
-			//   fully-inside:  s.Start >= srcSpan.Start AND s.End <= srcSpan.End
-			//   straddle:      everything else
-			endLEStart := cmp(s.End, srcSpan.Start) <= 0
-			startGEEnd := cmp(s.Start, srcSpan.End) >= 0
-			if endLEStart || startGEEnd {
+			// Skip fully-outside fragments.
+			if cmp(s.End, srcSpan.Start) <= 0 || cmp(s.Start, srcSpan.End) >= 0 {
 				continue
 			}
-			startInside := cmp(s.Start, srcSpan.Start) >= 0
-			endInside := cmp(s.End, srcSpan.End) <= 0
-			if startInside && endInside {
-				recordInSpan(s)
-				continue
+			effStart := s.Start
+			if cmp(effStart, srcSpan.Start) < 0 {
+				effStart = srcSpan.Start
 			}
-			return errors.Wrapf(ErrUnsupportedClone,
-				"source table %s at L%d contains a %s fragment [%s, %s) that straddles srcSpan [%s, %s)",
-				m.TableNum, level, kind,
-				d.opts.Comparer.FormatKey(s.Start), d.opts.Comparer.FormatKey(s.End),
-				d.opts.Comparer.FormatKey(srcSpan.Start), d.opts.Comparer.FormatKey(srcSpan.End))
+			effEnd := s.End
+			if cmp(effEnd, srcSpan.End) > 0 {
+				effEnd = srcSpan.End
+			}
+			smallest := base.InternalKey{
+				UserKey: append([]byte(nil), effStart...),
+				Trailer: s.Keys[0].Trailer,
+			}
+			updateBounds(smallest,
+				base.MakeExclusiveSentinelKey(s.Keys[len(s.Keys)-1].Kind(), append([]byte(nil), effEnd...)),
+				s.Keys[0].Kind(), s.Keys[0].Trailer)
 		}
 		return nil
 	}
+	_ = level // formerly used in the now-removed straddler error message
 
 	err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
 		func(r *sstable.Reader, _ sstable.ReadEnv) error {
@@ -1171,20 +1364,23 @@ func (d *DB) surveyAndValidateFragments(
 					"pebble: VirtualClone failed opening range-del iterator on source %s",
 					m.TableNum)
 			}
-			if err := walk("range deletion", rdel, func(s *keyspan.Span) {
-				smallest := s.SmallestKey()
-				largest := base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeDelete, s.End)
+			if err := walk(rdel, func(smallest, largest base.InternalKey, _ base.InternalKeyKind, _ base.InternalKeyTrailer) {
+				// Force the largest's kind to RangeDelete (uniform regardless
+				// of the source span's keys[len-1] kind, since point-key
+				// bounds for range deletions are always RangeDelete-kinded
+				// exclusive sentinels).
+				largest = base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeDelete, largest.UserKey)
 				if !survey.hasInSpanRangeDel {
 					survey.hasInSpanRangeDel = true
-					survey.smallestRangeDel = smallest.Clone()
-					survey.largestRangeDel = largest.Clone()
+					survey.smallestRangeDel = smallest
+					survey.largestRangeDel = largest
 					return
 				}
 				if base.InternalCompare(cmp, smallest, survey.smallestRangeDel) < 0 {
-					survey.smallestRangeDel = smallest.Clone()
+					survey.smallestRangeDel = smallest
 				}
 				if base.InternalCompare(cmp, largest, survey.largestRangeDel) > 0 {
-					survey.largestRangeDel = largest.Clone()
+					survey.largestRangeDel = largest
 				}
 			}); err != nil {
 				return err
@@ -1199,22 +1395,18 @@ func (d *DB) surveyAndValidateFragments(
 					"pebble: VirtualClone failed opening range-key iterator on source %s",
 					m.TableNum)
 			}
-			return walk("range key", rkey, func(s *keyspan.Span) {
-				smallest := s.SmallestKey()
-				// For range keys, the largest is an exclusive sentinel using
-				// the maximum range-key kind. Mirroring keyspan.Span.LargestKey
-				// behavior for the table's bounds.
-				largest := base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeKeyMax, s.End)
+			return walk(rkey, func(smallest, largest base.InternalKey, _ base.InternalKeyKind, _ base.InternalKeyTrailer) {
+				largest = base.MakeExclusiveSentinelKey(base.InternalKeyKindRangeKeyMax, largest.UserKey)
 				if !survey.hasInSpanRangeKey {
 					survey.hasInSpanRangeKey = true
-					survey.smallestRangeKey = smallest.Clone()
-					survey.largestRangeKey = largest.Clone()
+					survey.smallestRangeKey = smallest
+					survey.largestRangeKey = largest
 				} else {
 					if base.InternalCompare(cmp, smallest, survey.smallestRangeKey) < 0 {
-						survey.smallestRangeKey = smallest.Clone()
+						survey.smallestRangeKey = smallest
 					}
 					if base.InternalCompare(cmp, largest, survey.largestRangeKey) > 0 {
-						survey.largestRangeKey = largest.Clone()
+						survey.largestRangeKey = largest
 					}
 				}
 				// We don't have a per-fragment kind classifier here; record
@@ -1382,6 +1574,182 @@ func (d *DB) rewriteBoundaryBlock(
 		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
 		return nil, 0, errors.Wrapf(err,
 			"pebble: VirtualClone boundary table %s is invalid", pm.TableNum)
+	}
+	return pm, fileNum, nil
+}
+
+// rewriteStraddlerFragments reads the source SST's range deletion and range
+// key fragments, truncates each to srcSpan, translates start/end into dst
+// space (using srcSpan.End → dstSpan.End for the boundary case), and writes
+// them to a new physical SST. The returned SST contains only fragments — no
+// point keys — and replaces the otherwise-needed bounds-extension of the
+// cloned virtual SST. Returns nil metadata when no in-span fragments exist.
+//
+// The new physical SST is intended to be placed at L0 by the caller (via
+// clonePlanEntry.forceL0) because its bounds — the truncated extent of the
+// fragments — typically encompass the cloned virtual SST and any boundary-
+// rewrite physical SSTs from the same source. L0's sublevel structure
+// tolerates that overlap whereas L1+ does not.
+func (d *DB) rewriteStraddlerFragments(
+	ctx context.Context,
+	m *manifest.TableMetadata,
+	srcSpan KeyRange,
+	srcPrefix []byte,
+	dstSpan KeyRange,
+	dstPrefix []byte,
+	level int,
+) (*manifest.TableMetadata, base.DiskFileNum, error) {
+	cmp := d.cmp
+
+	// Helper: clip a fragment to srcSpan and translate the user-key endpoints
+	// to dst space. Endpoints inside srcPrefix translate bytewise; an
+	// endpoint exactly equal to srcSpan.End maps to dstSpan.End.
+	//
+	// Each key's Suffix and Value are deep-copied because the underlying
+	// fragment iterator reuses (and, under invariants, mangles) the backing
+	// buffers across iterator advances. We collect spans up-front and only
+	// write them to the new SST after closing the reader, so retained slices
+	// must own their bytes.
+	clipAndTranslate := func(s *keyspan.Span) (translated keyspan.Span, ok bool) {
+		if cmp(s.End, srcSpan.Start) <= 0 || cmp(s.Start, srcSpan.End) >= 0 {
+			return keyspan.Span{}, false
+		}
+		effStart := s.Start
+		if cmp(effStart, srcSpan.Start) < 0 {
+			effStart = srcSpan.Start
+		}
+		effEnd := s.End
+		if cmp(effEnd, srcSpan.End) > 0 {
+			effEnd = srcSpan.End
+		}
+		clonedKeys := make([]keyspan.Key, len(s.Keys))
+		for i := range s.Keys {
+			clonedKeys[i] = keyspan.Key{
+				Trailer: s.Keys[i].Trailer,
+				Suffix:  append([]byte(nil), s.Keys[i].Suffix...),
+				Value:   append([]byte(nil), s.Keys[i].Value...),
+			}
+		}
+		translated = keyspan.Span{
+			Start:     translateBoundaryUserKey(srcPrefix, dstPrefix, srcSpan, dstSpan, effStart),
+			End:       translateBoundaryUserKey(srcPrefix, dstPrefix, srcSpan, dstSpan, effEnd),
+			Keys:      clonedKeys,
+			KeysOrder: s.KeysOrder,
+		}
+		return translated, true
+	}
+
+	// Two-phase: collect spans first, then write. Collecting first lets us
+	// compute the writer's level / bounds before opening the writable, and
+	// avoids holding a reader open across the writer's I/O.
+	var rangedelSpans, rangekeySpans []keyspan.Span
+	if err := d.fileCache.withReader(ctx, block.NoReadEnv, m,
+		func(r *sstable.Reader, _ sstable.ReadEnv) error {
+			rdel, err := r.NewRawRangeDelIter(ctx, sstable.NoFragmentTransforms, sstable.NoReadEnv)
+			if err != nil {
+				return errors.Wrapf(err,
+					"pebble: VirtualClone failed opening range-del iterator on source %s",
+					m.TableNum)
+			}
+			if rdel != nil {
+				defer rdel.Close()
+				for s, err := rdel.First(); s != nil || err != nil; s, err = rdel.Next() {
+					if err != nil {
+						return errors.Wrapf(err,
+							"pebble: VirtualClone failed iterating range-del on source %s",
+							m.TableNum)
+					}
+					if t, ok := clipAndTranslate(s); ok {
+						rangedelSpans = append(rangedelSpans, t)
+					}
+				}
+			}
+
+			if !m.HasRangeKeys {
+				return nil
+			}
+			rkey, err := r.NewRawRangeKeyIter(ctx, sstable.NoFragmentTransforms, sstable.NoReadEnv)
+			if err != nil {
+				return errors.Wrapf(err,
+					"pebble: VirtualClone failed opening range-key iterator on source %s",
+					m.TableNum)
+			}
+			if rkey != nil {
+				defer rkey.Close()
+				for s, err := rkey.First(); s != nil || err != nil; s, err = rkey.Next() {
+					if err != nil {
+						return errors.Wrapf(err,
+							"pebble: VirtualClone failed iterating range-key on source %s",
+							m.TableNum)
+					}
+					if t, ok := clipAndTranslate(s); ok {
+						rangekeySpans = append(rangekeySpans, t)
+					}
+				}
+			}
+			return nil
+		}); err != nil {
+		return nil, 0, err
+	}
+	if len(rangedelSpans) == 0 && len(rangekeySpans) == 0 {
+		return nil, 0, nil
+	}
+
+	tableNum := d.mu.versions.getNextTableNum()
+	fileNum := base.PhysicalTableDiskFileNum(tableNum)
+
+	writable, _, err := d.objProvider.Create(ctx, base.FileTypeTable, fileNum,
+		objstorage.CreateOptions{PreferSharedStorage: false})
+	if err != nil {
+		return nil, 0, errors.Wrapf(err,
+			"pebble: VirtualClone failed to create fragment SST object")
+	}
+
+	// Use the source level's writer options for format + block-prop collectors;
+	// the actual placement is L0 (set on the clonePlanEntry).
+	writerOpts := d.opts.MakeWriterOptions(level, d.TableFormat())
+	tw := sstable.NewRawWriter(writable, writerOpts)
+	for i := range rangedelSpans {
+		if err := tw.EncodeSpan(rangedelSpans[i]); err != nil {
+			_ = tw.Close()
+			_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+			return nil, 0, errors.Wrapf(err, "pebble: VirtualClone fragment range-del write")
+		}
+	}
+	for i := range rangekeySpans {
+		if err := tw.EncodeSpan(rangekeySpans[i]); err != nil {
+			_ = tw.Close()
+			_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+			return nil, 0, errors.Wrapf(err, "pebble: VirtualClone fragment range-key write")
+		}
+	}
+	if err := tw.Close(); err != nil {
+		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+		return nil, 0, errors.Wrapf(err, "pebble: VirtualClone fragment close")
+	}
+	wm, err := tw.Metadata()
+	if err != nil {
+		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+		return nil, 0, errors.Wrapf(err, "pebble: VirtualClone fragment metadata")
+	}
+
+	pm := &manifest.TableMetadata{
+		TableNum:              tableNum,
+		Size:                  wm.Size,
+		SeqNums:               wm.SeqNums,
+		LargestSeqNumAbsolute: wm.SeqNums.High,
+	}
+	if len(rangedelSpans) > 0 {
+		pm.ExtendPointKeyBounds(d.cmp, wm.SmallestRangeDel, wm.LargestRangeDel)
+	}
+	if len(rangekeySpans) > 0 {
+		pm.ExtendRangeKeyBounds(d.cmp, manifest.AnyRangeKeys, wm.SmallestRangeKey, wm.LargestRangeKey)
+	}
+	pm.InitPhysicalBacking()
+	if err := pm.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+		_ = d.objProvider.Remove(base.FileTypeTable, fileNum)
+		return nil, 0, errors.Wrapf(err,
+			"pebble: VirtualClone fragment table %s is invalid", pm.TableNum)
 	}
 	return pm, fileNum, nil
 }

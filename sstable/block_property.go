@@ -156,6 +156,44 @@ type BlockPropertyCollector interface {
 // BlockPropertyFilter is used in an Iterator to filter sstables and blocks
 // within the sstable. It should not maintain any per-sstable state, and must
 // be thread-safe.
+//
+// Interaction with BlockPrefixSubstitution (VirtualClone)
+//
+// When a virtual sstable carries a BlockPrefixSubstitution transform (e.g.
+// from VirtualClone), block properties stored in that sstable's index were
+// computed at write time over storage-space (Src) keys, while filter probes
+// at read time arrive in destination-space (Dst) keys. Pebble does not
+// invert the probe in BlockPropertyFilter.Intersects; the bound-limited
+// path (KeyIsWithinUpperBound / KeyIsWithinLowerBound) compares against
+// index separators, which the index iter materializes in Dst-space and is
+// safe.
+//
+// To produce correct results across substituted virtual sstables a
+// BlockPropertyCollector and its companion BlockPropertyFilter must be
+// substitution-invariant: the property value (and the filter's
+// Intersects-encoded query) must depend only on key bytes that the
+// substitution does not touch. Substitution rewrites a fixed-length
+// leading prefix and preserves all suffix bytes, value bytes, and key
+// kinds, so a property is substitution-invariant if it is a function of
+// any subset of those. Concretely:
+//
+//   - Suffix-only properties (e.g. MVCC timestamp bounds extracted from a
+//     trailing timestamp portion) are substitution-invariant. ✓
+//   - Value-only properties (e.g. value-size buckets) are
+//     substitution-invariant. ✓
+//   - Key-kind properties (e.g. "block contains a tombstone") are
+//     substitution-invariant. ✓
+//   - Properties that depend on the leading user-key bytes that overlap
+//     srcPrefix / dstPrefix (e.g. "block min/max user key", "block
+//     contains keys under partition X") are NOT substitution-invariant
+//     and will silently return wrong filter results on cloned virtual
+//     sstables.
+//
+// BlockPropertyCollectors registered with cockroachkvs are
+// MVCC-timestamp-based and so are substitution-invariant; pebble's own
+// defaults likewise. Callers registering custom collectors that examine
+// the user-key prefix must either ensure their filters never run against
+// cloned virtual sstables or accept the silent-wrong-results risk.
 type BlockPropertyFilter = base.BlockPropertyFilter
 
 // BoundLimitedBlockPropertyFilter implements the block-property filter but

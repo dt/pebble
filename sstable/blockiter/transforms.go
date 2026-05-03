@@ -290,6 +290,27 @@ func (ps SyntheticPrefixAndSuffix) RemoveSuffix() SyntheticPrefixAndSuffix {
 // At seek time, callers in the destination key space must Invert the seek
 // key (replace Dst with Src) before consulting the block's index/search
 // structures; the iterator-emitted keys are produced via Apply.
+//
+// Filter probes (bloom filter, block-property filter)
+//
+// Bloom filter probes invert Dst→Src before consulting the stored filter
+// (see sstable/reader_iter_single_lvl.go bloomFilterMayContain). This is
+// load-bearing: without inversion, a Dst-space probe key would never
+// match the Src-space-hashed filter, producing silent false negatives
+// (read returns nil despite the key existing).
+//
+// Block-property filter (BlockPropertyFilter.Intersects) does NOT invert
+// the configured query against the stored properties. The bound-limited
+// filter path that compares against index separators IS safe (separators
+// are materialized via Apply at the index iter, so the comparison is
+// Dst-vs-Dst). For correctness across substituted virtual sstables, any
+// BlockPropertyCollector / BlockPropertyFilter pair used must be
+// substitution-invariant: the collected property and the filter's
+// query-encoding must depend only on key bytes the substitution does not
+// touch (the suffix portion, value bytes, key kind). Properties derived
+// from the substituted prefix bytes (e.g. "block min/max user key") will
+// silently return wrong filter results on cloned virtual sstables. See
+// the BlockPropertyFilter doc comment for the full contract.
 type BlockPrefixSubstitution struct {
 	// Src is the byte slice present at the start of every block-shared prefix
 	// in the underlying sstable that this transform is configured to replace.

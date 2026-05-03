@@ -5,6 +5,7 @@
 package pebble
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"slices"
@@ -23,6 +24,44 @@ import (
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/stretchr/testify/require"
 )
+
+// dstSpanForTest derives the dst-prefix-space span that VirtualClone should
+// excise from a srcSpan/srcPrefix/dstPrefix triple, suitable for the bytewise
+// (testkeys) Comparer used in this test file. Pebble's VirtualClone API
+// requires the caller to supply dstSpan because the dst-end key is encoding-
+// sensitive (e.g. CRDB's cockroachkvs Comparer reads a trailing suffix-length
+// byte that bytes-prefix-end cannot synthesize); tests under the testkeys
+// Comparer can derive it locally.
+//
+//   - dstSpan.Start: bytewise translation of srcSpan.Start under
+//     srcPrefix→dstPrefix (which must be equal-length).
+//   - dstSpan.End: bytewise translation of srcSpan.End if srcSpan.End starts
+//     with srcPrefix; otherwise bytesPrefixEnd(dstPrefix) — the smallest
+//     byte string strictly greater than every key starting with dstPrefix.
+func dstSpanForTest(srcSpan KeyRange, srcPrefix, dstPrefix []byte) KeyRange {
+	if !bytes.HasPrefix(srcSpan.Start, srcPrefix) {
+		panic(errors.Newf("dstSpanForTest: srcSpan.Start %q does not have srcPrefix %q",
+			srcSpan.Start, srcPrefix))
+	}
+	if len(srcPrefix) != len(dstPrefix) {
+		panic(errors.Newf("dstSpanForTest: srcPrefix and dstPrefix must be equal-length"))
+	}
+	start := append(append([]byte(nil), dstPrefix...), srcSpan.Start[len(srcPrefix):]...)
+	var end []byte
+	if bytes.HasPrefix(srcSpan.End, srcPrefix) {
+		end = append(append([]byte(nil), dstPrefix...), srcSpan.End[len(srcPrefix):]...)
+	} else {
+		end = append([]byte(nil), dstPrefix...)
+		for i := len(end) - 1; i >= 0; i-- {
+			if end[i] < 0xff {
+				end[i]++
+				end = end[:i+1]
+				break
+			}
+		}
+	}
+	return KeyRange{Start: start, End: end}
+}
 
 // openCloneTestDB opens an in-memory DB at the FormatPrefixSubstitution format
 // major version (or the provided lower version, for the format-gate test).
@@ -161,7 +200,7 @@ func TestVirtualClone_HappyPathSingleSST(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Reads on dst-space keys should return the cloned values.
 	for _, k := range srcKeys {
@@ -219,7 +258,7 @@ func TestVirtualClone_MultipleFullyContainedSSTsAcrossLevels(t *testing.T) {
 	require.GreaterOrEqual(t, levelsWithData, 2, "test setup needs data at multiple levels")
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	want := []string{
 		"/tenant/4/A0", "/tenant/4/A1", "/tenant/4/A2",
@@ -255,7 +294,7 @@ func TestVirtualClone_StraddlingSrcSpanLowerEnd(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// The destination should contain only the in-span keys, translated.
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
@@ -277,7 +316,7 @@ func TestVirtualClone_FormatGate(t *testing.T) {
 	dstPrefix := []byte("/tenant/4/")
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
 
-	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "format major version")
 }
@@ -302,7 +341,7 @@ func TestVirtualClone_DestinationExcised(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// The dst region should now hold only the cloned src keys.
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
@@ -322,7 +361,7 @@ func TestVirtualClone_EmptySrcSpan(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// The dst region should remain empty.
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
@@ -339,25 +378,40 @@ func TestVirtualClone_InputValidation(t *testing.T) {
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	dstSpan := dstSpanForTest(srcSpan, srcPrefix, dstPrefix)
 
 	cases := []struct {
 		name              string
-		span              KeyRange
-		src, dst          []byte
+		srcSpan           KeyRange
+		src               []byte
+		dstSpan           KeyRange
+		dst               []byte
 		expectErrContains string
 	}{
-		{"empty-src", srcSpan, nil, dstPrefix, "non-empty srcPrefix"},
-		{"empty-dst", srcSpan, srcPrefix, nil, "non-empty dstPrefix"},
-		{"same-prefix", srcSpan, srcPrefix, srcPrefix, "must differ"},
+		{"empty-src", srcSpan, nil, dstSpan, dstPrefix, "non-empty srcPrefix"},
+		{"empty-dst", srcSpan, srcPrefix, dstSpan, nil, "non-empty dstPrefix"},
+		{"same-prefix", srcSpan, srcPrefix, srcSpan, srcPrefix, "must differ"},
 		{
-			"span-start-outside-src",
+			"src-span-start-outside-src",
 			KeyRange{Start: []byte("/tenant/0/x"), End: []byte("/tenant/2/")},
-			srcPrefix, dstPrefix, "does not have srcPrefix",
+			srcPrefix, dstSpan, dstPrefix, "srcSpan start",
+		},
+		{
+			"dst-span-start-outside-dst",
+			srcSpan, srcPrefix,
+			KeyRange{Start: []byte("/tenant/9/x"), End: []byte("/tenant/9/y")},
+			dstPrefix, "dstSpan start",
+		},
+		{
+			"dst-span-start-mismatch",
+			srcSpan, srcPrefix,
+			KeyRange{Start: []byte("/tenant/4/x"), End: []byte("/tenant/5/")},
+			dstPrefix, "does not match srcSpan start",
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := d.VirtualClone(context.Background(), c.span, c.src, c.dst)
+			err := d.VirtualClone(context.Background(), c.srcSpan, c.src, c.dstSpan, c.dst)
 			require.Error(t, err)
 			require.False(t, errors.Is(err, ErrUnsupportedClone),
 				"expected input-validation error, got ErrUnsupportedClone: %v", err)
@@ -392,7 +446,7 @@ func TestVirtualClone_StraddlingSrcSpanUpperEnd(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Len(t, got, 30)
@@ -428,7 +482,7 @@ func TestVirtualClone_BothEndsStraddling(t *testing.T) {
 
 	// Sub-range clone strictly inside /tenant/1/.
 	srcSpan := KeyRange{Start: []byte("/tenant/1/k005"), End: []byte("/tenant/1/k025")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	for _, k := range got {
@@ -531,7 +585,7 @@ func TestVirtualClone_BoundaryBlock_ValueBlockValues(t *testing.T) {
 			"resolution. Adjust the key layout to ensure value-block routing.")
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Verify every cloned key reads back the original value. This is the
 	// assertion that previously crashed: if any of the boundary-block in-span
@@ -595,7 +649,7 @@ func TestVirtualClone_MixedInteriorAndStraddlers(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	// We expect 10 a* + 5 b* + 10 c* = 25 keys.
@@ -624,7 +678,7 @@ func TestVirtualClone_BlockPropertyFilterDisabled(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// A regular scan must surface the cloned keys regardless of any default
 	// block property filter behavior.
@@ -653,7 +707,7 @@ func TestVirtualClone_MemtableOnly(t *testing.T) {
 	setMany(t, d, srcKeys, value)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Cloned dst-space keys must be readable.
 	for _, k := range srcKeys {
@@ -688,7 +742,7 @@ func TestVirtualClone_MixedMemtableAndLSM(t *testing.T) {
 	setMany(t, d, memKeys, value)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	want := []string{
 		"/tenant/4/A0", "/tenant/4/A1", "/tenant/4/A2",
@@ -723,7 +777,7 @@ func TestVirtualClone_NoMemtableOverlap(t *testing.T) {
 	setMany(t, d, []string{"/tenant/9/x", "/tenant/9/y"}, value)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Only the LSM-resident in-span data should appear in dst-space.
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
@@ -785,7 +839,7 @@ func TestVirtualClone_Race_CompactionDuringClone(t *testing.T) {
 	d.mu.Unlock()
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// We expect at least 2 attempts: the first is aborted by the compaction
 	// and the second succeeds.
@@ -877,7 +931,7 @@ func TestVirtualClone_Race_RetriesExhausted(t *testing.T) {
 	}
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "exhausted")
 	require.Equal(t, int32(virtualCloneMaxRetries), attempts.Load(),
@@ -980,7 +1034,7 @@ func TestVirtualClone_Race_ExciseDuringClone(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
+	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix)
 	// The clone must either succeed (after retry against the post-excise
 	// LSM) or return a graceful error; it must never panic or deadlock.
 	if err != nil {
@@ -1042,7 +1096,7 @@ func TestVirtualClone_Race_FlushDuringClone(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// We expect exactly one attempt: a flush into a new L0 SST does not
 	// invalidate any source backing snapshotted by the clone, and L0 always
@@ -1092,11 +1146,13 @@ func TestVirtualClone_Race_ConcurrentClonesOverlappingDst(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		results[0] = d.VirtualClone(context.Background(), srcSpanA, srcPrefixA, dstPrefix)
+		results[0] = d.VirtualClone(context.Background(), srcSpanA, srcPrefixA,
+			dstSpanForTest(srcSpanA, srcPrefixA, dstPrefix), dstPrefix)
 	}()
 	go func() {
 		defer wg.Done()
-		results[1] = d.VirtualClone(context.Background(), srcSpanB, srcPrefixB, dstPrefix)
+		results[1] = d.VirtualClone(context.Background(), srcSpanB, srcPrefixB,
+			dstSpanForTest(srcSpanB, srcPrefixB, dstPrefix), dstPrefix)
 	}()
 	wg.Wait()
 
@@ -1152,7 +1208,7 @@ func TestVirtualClone_OrphanCleanupOnRetry(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Compute the set of live disk file numbers.
 	live := make(map[base.DiskFileNum]struct{})
@@ -1202,7 +1258,7 @@ func TestVirtualClone_TwoLevelIndex_FullyContained(t *testing.T) {
 	requireTwoLevelIndex(t, d, srcPrefix)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Len(t, got, 200)
@@ -1240,7 +1296,7 @@ func TestVirtualClone_TwoLevelIndex_LowerStraddler(t *testing.T) {
 	requireTwoLevelIndex(t, d, srcPrefix)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Len(t, got, 200)
@@ -1277,7 +1333,7 @@ func TestVirtualClone_TwoLevelIndex_UpperStraddler(t *testing.T) {
 	requireTwoLevelIndex(t, d, srcPrefix)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Len(t, got, 200)
@@ -1315,7 +1371,7 @@ func TestVirtualClone_TwoLevelIndex_BothEnds(t *testing.T) {
 
 	// srcSpan strictly inside /tenant/1/.
 	srcSpan := KeyRange{Start: []byte("/tenant/1/k00010"), End: []byte("/tenant/1/k00150")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Len(t, got, 140)
@@ -1357,7 +1413,7 @@ func TestVirtualClone_TwoLevelIndex_RunCrossesSecondLevelBoundary(t *testing.T) 
 	requireTwoLevelIndex(t, d, srcPrefix)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
 	require.Len(t, got, 600)
@@ -1433,7 +1489,7 @@ func TestVirtualClone_RangeDelete_FullyInside(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// The dst-space scan should observe k1, k4, k5 (k2 and k3 are deleted).
 	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
@@ -1463,7 +1519,7 @@ func TestVirtualClone_RangeKeySet_FullyInside(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	points, ranges := scanRangeWithRangeKeys(t, d,
 		dstPrefix, []byte("/tenant/5/"))
@@ -1499,7 +1555,7 @@ func TestVirtualClone_RangeKey_FullyOutside(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	points, ranges := scanRangeWithRangeKeys(t, d,
 		dstPrefix, []byte("/tenant/5/"))
@@ -1508,7 +1564,10 @@ func TestVirtualClone_RangeKey_FullyOutside(t *testing.T) {
 }
 
 // TestVirtualClone_RangeKey_Straddling verifies that a source SST whose range
-// key straddles a srcSpan boundary returns ErrUnsupportedClone.
+// key straddles the srcSpan upper boundary clones successfully: the
+// straddling fragment is truncated to srcSpan and materialized into a
+// separate physical SST (placed at L0 to admit the bounds-overlap with the
+// cloned virtual SST and any boundary-rewrite physical SSTs).
 func TestVirtualClone_RangeKey_Straddling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
@@ -1528,16 +1587,28 @@ func TestVirtualClone_RangeKey_Straddling(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrUnsupportedClone),
-		"expected ErrUnsupportedClone, got %v", err)
-	require.Contains(t, err.Error(), "straddles")
-	require.Contains(t, err.Error(), "range key")
+	dstSpan := dstSpanForTest(srcSpan, srcPrefix, dstPrefix)
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpan, dstPrefix))
+
+	// Dst region: point keys cloned, range key truncated at srcSpan.End and
+	// translated to dstSpan.End (which dstSpanForTest derived from srcSpan).
+	points, ranges := scanRangeWithRangeKeys(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/p1", "/tenant/4/p2"}, points)
+	require.Equal(t, []string{
+		fmt.Sprintf("[/tenant/4/ra,%s),@5=rk-value", string(dstSpan.End)),
+	}, ranges)
+
+	// Source space still sees the full original range key.
+	srcPoints, srcRanges := scanRangeWithRangeKeys(t, d, srcPrefix, []byte("/tenant/3/"))
+	require.Equal(t, []string{"/tenant/1/p1", "/tenant/1/p2"}, srcPoints)
+	require.Equal(t, []string{"[/tenant/1/ra,/tenant/2/rz),@5=rk-value"}, srcRanges)
 }
 
 // TestVirtualClone_RangeDel_Straddling verifies that a source SST whose range
-// deletion straddles a srcSpan boundary returns ErrUnsupportedClone.
+// deletion straddles the srcSpan upper boundary clones successfully: the
+// truncated rangedel is materialized into a separate L0 physical SST and
+// continues to suppress the in-srcSpan SET keys in dst space, while NOT
+// bleeding past dstSpan into adjacent dst regions.
 func TestVirtualClone_RangeDel_Straddling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
@@ -1548,17 +1619,39 @@ func TestVirtualClone_RangeDel_Straddling(t *testing.T) {
 	value := []byte("v")
 
 	setMany(t, d, []string{"/tenant/1/p1", "/tenant/1/p2"}, value)
+	// DeleteRange straddles srcSpan upper bound /tenant/2/.
 	require.NoError(t, d.DeleteRange(
 		[]byte("/tenant/1/p1"), []byte("/tenant/2/x"), nil))
 	require.NoError(t, d.Flush())
 
+	// Live dst-space key beyond dstSpan that must survive — proves the
+	// truncated rangedel doesn't bleed past dstSpan.End.
+	require.NoError(t, d.Set([]byte("/tenant/5/keep"), value, nil))
+	require.NoError(t, d.Flush())
+
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	err := d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrUnsupportedClone),
-		"expected ErrUnsupportedClone, got %v", err)
-	require.Contains(t, err.Error(), "straddles")
-	require.Contains(t, err.Error(), "range deletion")
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix,
+		dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
+
+	// The truncated rangedel covers /tenant/4/p1..p2 in dst — both should miss.
+	for _, k := range []string{"/tenant/4/p1", "/tenant/4/p2"} {
+		_, closer, err := d.Get([]byte(k))
+		require.ErrorIs(t, err, ErrNotFound, "expected dst key %s to be deleted", k)
+		if closer != nil {
+			require.NoError(t, closer.Close())
+		}
+	}
+	// /tenant/5/keep must still be live.
+	require.Equal(t, value, mustGet(t, d, "/tenant/5/keep"))
+
+	// Source-space rangedel still covers its full original range.
+	for _, k := range []string{"/tenant/1/p1", "/tenant/1/p2"} {
+		_, closer, err := d.Get([]byte(k))
+		require.ErrorIs(t, err, ErrNotFound, "src key %s should still be deleted", k)
+		if closer != nil {
+			require.NoError(t, closer.Close())
+		}
+	}
 }
 
 // TestVirtualClone_MixedRangeKeys_InsideAndOutside verifies that an SST with
@@ -1595,7 +1688,7 @@ func TestVirtualClone_MixedRangeKeys_InsideAndOutside(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	points, ranges := scanRangeWithRangeKeys(t, d,
 		dstPrefix, []byte("/tenant/5/"))
@@ -1640,7 +1733,7 @@ func TestVirtualClone_RangeKey_PointStraddler(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// All 30 in-span point keys should be visible in dst, plus the in-span
 	// range key.
@@ -1731,7 +1824,16 @@ func TestVirtualClone_PrefixLengthInvariant(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := validateVirtualCloneInputs(c.cmp, c.span, c.src, c.dst)
+			// Build a dstSpan satisfying validation only when src/dst are
+			// equal-length and the span starts within src; for the
+			// different-length case the input fails earlier on length.
+			var dstSpan KeyRange
+			if len(c.src) == len(c.dst) && bytes.HasPrefix(c.span.Start, c.src) {
+				dstSpan = dstSpanForTest(c.span, c.src, c.dst)
+			} else {
+				dstSpan = KeyRange{Start: c.dst, End: append(append([]byte{}, c.dst...), 0xff)}
+			}
+			err := validateVirtualCloneInputs(c.cmp, c.span, c.src, dstSpan, c.dst)
 			if c.expectErrContains == "" {
 				require.NoError(t, err)
 				return
@@ -1808,7 +1910,7 @@ func TestVirtualClone_SentinelPrefixEndToEnd(t *testing.T) {
 	// srcSpan covers exactly the in-prefix range. End is the prefix's
 	// immediate successor (one past the last sentinel byte).
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/1/\"")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Reads on dst-space keys should return the cloned values.
 	for _, k := range srcKeys {
@@ -1845,7 +1947,7 @@ func TestVirtualClone_ReproZombieBackingOnSourceCompact(t *testing.T) {
 	require.NoError(t, d.Flush())
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Write a new version of one of the source keys, flush, and compact the
 	// source range. This forces a real rewrite of the source-side SST (not a
@@ -2119,7 +2221,7 @@ func TestVirtualClone_CRDBShape_Smoke(t *testing.T) {
 			"path has to walk past occupied levels")
 
 	// 5. Run the clone.
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// 6. Read every src key back from its dst-translated counterpart and
 	//    verify it matches.
@@ -2297,7 +2399,7 @@ func TestVirtualClone_BoundaryBlock_BlobHandleValues(t *testing.T) {
 	requireBlobRefsOnSource(t, d, srcPrefix)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Read every in-span key back through dst-space. Boundary blocks were
 	// rewritten as a fresh physical SST whose values must match the originals
@@ -2397,7 +2499,7 @@ func TestVirtualClone_BoundaryBlock_MixedValueShapes(t *testing.T) {
 			"mixed-shape coverage would be incomplete")
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Each cloned key must read back the source value across all three
 	// underlying storage shapes.
@@ -2472,7 +2574,7 @@ func TestVirtualClone_FirstAndLastKey_BlobHandleEndpoints(t *testing.T) {
 	requireBlobRefsOnSource(t, d, srcPrefix)
 
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
-	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstPrefix))
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
 	// Read every in-span key back through dst-space; the virtual SST cover
 	// of the in-span run uses the first/last-key derived bounds.
@@ -2487,5 +2589,66 @@ func TestVirtualClone_FirstAndLastKey_BlobHandleEndpoints(t *testing.T) {
 	// And source-side reads.
 	for _, p := range pairs {
 		require.Equal(t, p.val, mustGet(t, d, p.key))
+	}
+}
+
+// TestVirtualClone_SourceStraddlesDstSpan exercises the case where a single
+// source SST has bounds that span both srcPrefix and dstPrefix — common
+// after a snapshot receive into a region neighboring an existing tenant.
+// Phase A defers the file's stand-in / DeletedTables / CreatedBackingTables
+// to phase B's dst-excise (exciseTable + applyExciseToVersionEdit), which
+// trims the file at dstSpan boundaries via a virtual leftTable. The cloned
+// in-srcSpan data should land in dst space; the dst-space portion of the
+// straddling file should be excised; the src-space portion should remain
+// readable.
+func TestVirtualClone_SourceStraddlesDstSpan(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	d := openCloneTestDB(t, FormatPrefixSubstitution)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	srcPrefix := []byte("/tenant/1/")
+	dstPrefix := []byte("/tenant/4/")
+	value := []byte("v")
+
+	// A single SST whose bounds span both src and dst prefixes. Writing the
+	// keys in one batch + flush keeps them in one file. The flushed SST has
+	// bounds roughly [/tenant/1/k0, /tenant/4/zzz].
+	setMany(t, d, []string{
+		"/tenant/1/k0", "/tenant/1/k1", "/tenant/1/k2",
+		"/tenant/4/preexisting-a", "/tenant/4/preexisting-b", "/tenant/4/zzz",
+	}, value)
+	require.NoError(t, d.Flush())
+
+	// Sanity: confirm a single SST contains both src and dst keys.
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+	var straddlerCount int
+	srcDstBounds := base.UserKeyBoundsEndExclusive(srcPrefix, []byte("/tenant/5/"))
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, srcDstBounds).All() {
+			if bytes.HasPrefix(m.Smallest().UserKey, srcPrefix) &&
+				!bytes.HasPrefix(m.Largest().UserKey, srcPrefix) {
+				straddlerCount++
+			}
+		}
+	}
+	require.Equal(t, 1, straddlerCount,
+		"test setup needs a single SST that straddles src and dst prefixes")
+
+	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
+	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix,
+		dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
+
+	// Dst region: only the cloned src keys, not the straddler's pre-existing
+	// dst-space content (which the dst-excise wipes).
+	got := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
+	require.Equal(t, []string{"/tenant/4/k0", "/tenant/4/k1", "/tenant/4/k2"}, got)
+
+	// Src region: original keys still readable.
+	for _, k := range []string{"/tenant/1/k0", "/tenant/1/k1", "/tenant/1/k2"} {
+		require.Equal(t, value, mustGet(t, d, k))
 	}
 }
