@@ -6,6 +6,7 @@ package pebble
 
 import (
 	"cmp"
+	"runtime/debug"
 	"slices"
 
 	"github.com/cockroachdb/errors"
@@ -384,14 +385,30 @@ func makeZombieObjects() zombieObjects {
 // may access them are closed.
 type zombieObjects struct {
 	objs map[base.DiskFileNum]objectInfo
+	// addStacks holds the stack trace at the time each object was added to the
+	// zombie set. Populated only in invariant builds; used to print the prior
+	// add-site when an Add asserts on a duplicate.
+	addStacks map[base.DiskFileNum]string
 }
 
 // Add adds an object to the set of zombie objects.
 func (z *zombieObjects) Add(obj objectInfo) {
 	if _, ok := z.objs[obj.FileNum]; ok {
-		panic(errors.AssertionFailedf("zombie object %s already exists", obj.FileNum))
+		var prior string
+		if z.addStacks != nil {
+			prior = z.addStacks[obj.FileNum]
+		}
+		panic(errors.AssertionFailedf(
+			"zombie object %s already exists\nprior Add stack:\n%s\ncurrent Add stack:\n%s",
+			obj.FileNum, errors.Safe(prior), errors.Safe(string(debug.Stack()))))
 	}
 	z.objs[obj.FileNum] = obj
+	if invariants.Enabled {
+		if z.addStacks == nil {
+			z.addStacks = make(map[base.DiskFileNum]string)
+		}
+		z.addStacks[obj.FileNum] = string(debug.Stack())
+	}
 }
 
 // AddMetadata is like Add, but takes an ObjectMetadata and the object's size.
@@ -418,6 +435,7 @@ func (z *zombieObjects) Extract(fileNum base.DiskFileNum) objectInfo {
 		panic(errors.AssertionFailedf("zombie object %s not found", fileNum))
 	}
 	delete(z.objs, fileNum)
+	delete(z.addStacks, fileNum)
 	return obj
 }
 

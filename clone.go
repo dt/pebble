@@ -45,21 +45,27 @@ const virtualCloneMaxRetries = 5
 // Parameter encoding contract:
 //
 // ┌───────────────────┬──────────────────────────────┬──────────────────────────────────────┐
+//
 //	│ Parameter         │ Encoding                     │ Why                                  │
+//
 // ├───────────────────┼──────────────────────────────┼──────────────────────────────────────┤
+//
 //	│ srcPrefix         │ Raw bytes (no Comparer       │ This is the literal byte prefix      │
 //	│ dstPrefix         │   encoding, no sentinel).    │ BlockPrefixSubstitution will strip   │
 //	│                   │ Equal-length required.       │ from / replace at the start of every │
 //	│                   │                              │ in-block stored key. It must equal   │
 //	│                   │                              │ exactly the bytes physically present │
 //	│                   │                              │ at the start of stored keys.         │
+//
 // ├───────────────────┼──────────────────────────────┼──────────────────────────────────────┤
+//
 //	│ srcSpan.Start/End │ Comparer-encoded keys (e.g.  │ These are *keys* used in compare     │
 //	│ dstSpan.Start/End │   for CRDB:                  │ operations against SST bounds and    │
 //	│                   │   EngineKey{...}.Encode()).  │ memtable contents; they must be      │
 //	│                   │                              │ well-formed under the active         │
 //	│                   │                              │ Comparer (which may interpret e.g.   │
 //	│                   │                              │ a trailing byte as a suffix length). │
+//
 // └───────────────────┴──────────────────────────────┴──────────────────────────────────────┘
 //
 // Validation enforced by validateVirtualCloneInputs:
@@ -621,6 +627,7 @@ func (d *DB) installClonePlan(
 	jobID := d.newJobIDLocked()
 	defer d.mu.Unlock()
 
+	var appliedVE *manifest.VersionEdit
 	_, err := d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
 		current := d.mu.versions.currentVersion()
 
@@ -816,6 +823,7 @@ func (d *DB) installClonePlan(
 			return versionUpdate{}, nil
 		}
 
+		appliedVE = ve
 		return versionUpdate{
 			VE:                      ve,
 			JobID:                   jobID,
@@ -829,8 +837,45 @@ func (d *DB) installClonePlan(
 	if aborted {
 		return true, nil
 	}
+	d.fireCloneEvents(int(jobID), appliedVE)
 	d.updateReadStateLocked(d.opts.DebugCheck)
 	return false, nil
+}
+
+// fireCloneEvents emits EventListener notifications for the tables and
+// backings that VirtualClone added/removed via ve. VirtualClone bypasses the
+// flush/compaction/ingest paths that normally fire these events, so without
+// these calls cloned files are invisible to consumers of the storage event
+// stream (CockroachDB's storage log, the metamorphic harness, etc).
+func (d *DB) fireCloneEvents(jobID int, ve *manifest.VersionEdit) {
+	if ve == nil {
+		return
+	}
+	if d.opts.EventListener.TableCreated != nil {
+		for i := range ve.NewTables {
+			meta := ve.NewTables[i].Meta
+			fileNum := meta.TableBacking.DiskFileNum
+			objMeta, err := d.objProvider.Lookup(base.FileTypeTable, fileNum)
+			path := ""
+			if err == nil {
+				path = d.objProvider.Path(objMeta)
+			}
+			d.opts.EventListener.TableCreated(TableCreateInfo{
+				JobID:   jobID,
+				Reason:  "virtual-clone",
+				Path:    path,
+				FileNum: fileNum,
+			})
+		}
+	}
+	if d.opts.EventListener.TableDeleted != nil {
+		for _, m := range ve.DeletedTables {
+			d.opts.EventListener.TableDeleted(TableDeleteInfo{
+				JobID:   jobID,
+				FileNum: m.TableBacking.DiskFileNum,
+			})
+		}
+	}
 }
 
 // buildSourceStandIn produces a virtual TableMetadata that covers the full
