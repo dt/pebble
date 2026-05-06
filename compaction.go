@@ -2398,6 +2398,11 @@ func (d *DB) compact1(jobID JobID, c *tableCompaction) (err error) {
 	info.Duration = d.opts.private.timeNow().Sub(startTime)
 	if err == nil {
 		validateVersionEdit(ve, d.opts.Comparer.ValidateKey, d.opts.Comparer.FormatKey, d.opts.Logger)
+		if hook := d.opts.private.testingCompactionBeforeApply; hook != nil {
+			d.mu.Unlock()
+			hook()
+			d.mu.Lock()
+		}
 		_, err = d.mu.versions.UpdateVersionLocked(func() (versionUpdate, error) {
 			// Check if this compaction had a conflicting operation (eg. a d.excise())
 			// that necessitates it restarting from scratch. Note that since we hold

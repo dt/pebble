@@ -1243,6 +1243,14 @@ type Options struct {
 		// just before the apply phase.
 		testingCloneBeforeUpdateVersionLocked func(attempt int)
 
+		// testingCompactionBeforeApply, when non-nil, is called by compact1
+		// after runCompaction completes but before UpdateVersionLocked is
+		// invoked. d.mu is RELEASED across the call so the hook can issue
+		// concurrent operations (e.g. VirtualClone) that need d.mu, and
+		// re-acquired after the hook returns. Used by tests to deterministically
+		// open the race window between a compaction's input scan and its commit.
+		testingCompactionBeforeApply func()
+
 		// timeNow returns the current time. It defaults to time.Now. It's
 		// configurable here so that tests can mock the current time.
 		timeNow func() time.Time

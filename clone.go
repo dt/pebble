@@ -261,7 +261,7 @@ func (d *DB) installClonePlanViaCommitPipeline(
 			aborted = true
 			return
 		}
-		a, err := d.installClonePlan(ctx, attempt, entries, dstSpan, seqNum)
+		a, err := d.installClonePlan(ctx, attempt, entries, srcSpan, dstSpan, seqNum)
 		aborted = a
 		installErr = err
 	}
@@ -613,10 +613,13 @@ func (d *DB) installClonePlan(
 	ctx context.Context,
 	attempt int,
 	entries []clonePlanEntry,
+	srcSpan KeyRange,
 	dstSpan KeyRange,
 	exciseSeqNum base.SeqNum,
 ) (aborted bool, _ error) {
 	dstSpanBounds := dstSpan.UserKeyBounds()
+	srcSpanBounds := srcSpan.UserKeyBounds()
+	_ = srcSpanBounds
 
 	// Test hook: invoked just before re-acquiring d.mu and applying the
 	// version edit.
@@ -844,16 +847,22 @@ func (d *DB) installClonePlan(
 				Bounds: dstSpanBounds,
 				SeqNum: exciseSeqNum,
 			})
-			// Cancel any in-progress compaction whose output bounds overlap
-			// dstSpan: the compaction may write a file landing in dstSpan
-			// after the excise applies, defeating it. Mirrors the pattern in
-			// ingest.go:2457-2487.
+		}
+		// Cancel any in-progress compaction whose bounds overlap dstSpan
+		// or srcSpan. dstSpan: a compaction may write a file landing in
+		// dstSpan after the excise applies, defeating it. srcSpan: the
+		// stand-in replacement path replaces source physical SSTs with
+		// virtual stand-ins; a compaction whose inputs include that source
+		// would commit with a DeletedTables entry for a file no longer in
+		// the level.
+		if anyExcised || len(seenSource) > 0 {
 			for c := range d.mu.compact.inProgress {
 				if c.VersionEditApplied() {
 					continue
 				}
 				bounds := c.Bounds()
-				if bounds != nil && bounds.Overlaps(d.cmp, dstSpanBounds) {
+				if bounds != nil && (bounds.Overlaps(d.cmp, dstSpanBounds) ||
+					bounds.Overlaps(d.cmp, srcSpanBounds)) {
 					c.Cancel()
 				}
 			}
