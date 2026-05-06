@@ -3,7 +3,6 @@ package pebble
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/cockroachdb/crlib/testutils/leaktest"
 	"github.com/cockroachdb/pebble/cockroachkvs"
@@ -127,7 +126,89 @@ func TestVirtualClone_SyntheticSeqNumBoundsConsistency(t *testing.T) {
 	require.Greater(t, count, 0, "expected cloned data in dst span")
 }
 
-func init() {
-	// Ensure table stats collection runs promptly.
-	_ = time.Millisecond
+// TestVirtualClone_SyntheticSeqNumOverallBounds verifies that after the
+// SyntheticSeqNum trailer rewrite, the overall bounds (Smallest/Largest)
+// are consistent with the rewritten PointKeyBounds and RangeKeyBounds.
+// When both point and range keys exist at the same user key, the trailer
+// rewrite can change which bound type provides the overall smallest.
+func TestVirtualClone_SyntheticSeqNumOverallBounds(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	mem := vfs.NewMem()
+	opts := &Options{
+		Comparer:                    &cockroachkvs.Comparer,
+		BlockPropertyCollectors:     cockroachkvs.BlockPropertyCollectors,
+		FormatMajorVersion:          FormatPrefixSubstitution,
+		FS:                          mem,
+		KeySchema:                   cockroachkvs.KeySchema.Name,
+		KeySchemas:                  sstable.MakeKeySchemas(&cockroachkvs.KeySchema),
+		DisableAutomaticCompactions: true,
+	}
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	enc := func(roachKey []byte) []byte {
+		return cockroachkvs.EncodeKey(nil, roachKey, nil)
+	}
+	encMVCC := func(roachKey []byte, walltime uint64) []byte {
+		ver := []byte{
+			byte(walltime >> 56), byte(walltime >> 48), byte(walltime >> 40), byte(walltime >> 32),
+			byte(walltime >> 24), byte(walltime >> 16), byte(walltime >> 8), byte(walltime),
+		}
+		return cockroachkvs.EncodeKey(nil, roachKey, ver)
+	}
+
+	srcPrefix := []byte{0xfe, 0x8b}
+	dstPrefix := []byte{0xfe, 0x8c}
+
+	// RANGEKEYSET fully inside srcSpan (lower seqnum). Use a narrow
+	// range that doesn't touch srcSpan boundaries, so it stays in the
+	// cloned virtual (no forceL0 split).
+	rangeKeyStart := append(append([]byte{}, srcPrefix...), 0x88, 0x00)
+	rangeKeyEnd := append(append([]byte{}, srcPrefix...), 0x88, 0x10)
+	require.NoError(t, d.RangeKeySet(
+		enc(rangeKeyStart), enc(rangeKeyEnd), nil, []byte("val"), nil))
+	// Point key at same user key as RANGEKEYSET start (higher seqnum).
+	require.NoError(t, d.Set(enc(rangeKeyStart), []byte("v"), nil))
+	for i := 0; i < 5; i++ {
+		k := encMVCC(append(append([]byte{}, srcPrefix...), byte(0x88), byte(i)), uint64(100+i))
+		require.NoError(t, d.Set(k, []byte("v"), nil))
+	}
+	require.NoError(t, d.Flush())
+
+	// Advance the global seqnum so exciseSeqNum >> source seqnums.
+	for i := 0; i < 100; i++ {
+		k := encMVCC([]byte{0x01, byte(i)}, uint64(1000+i))
+		require.NoError(t, d.Set(k, []byte("padding"), nil))
+	}
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: enc(srcPrefix), End: enc([]byte{0xfe, 0x8c})}
+	dstSpan := KeyRange{Start: enc(dstPrefix), End: enc([]byte{0xfe, 0x8d})}
+	require.NoError(t, d.VirtualClone(context.Background(),
+		srcSpan, srcPrefix, dstSpan, dstPrefix))
+
+	// Validate all cloned virtuals. The "inconsistent range key bounds
+	// relative to overall bounds" error fires if the trailer rewrite
+	// doesn't update the overall bound types.
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	defer v.Unref()
+	for level := range v.Levels {
+		for m := range v.Levels[level].All() {
+			t.Logf("L%d table %s: HasPointKeys=%v HasRangeKeys=%v Smallest=%s Largest=%s",
+				level, m.TableNum, m.HasPointKeys, m.HasRangeKeys,
+				m.Smallest(), m.Largest())
+			if m.HasRangeKeys {
+				t.Logf("  RangeKeyBounds: [%s - %s]",
+					m.RangeKeyBounds.Smallest(), m.RangeKeyBounds.Largest())
+			}
+			if err := m.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+				t.Fatalf("L%d table %s: %v", level, m.TableNum, err)
+			}
+		}
+	}
 }

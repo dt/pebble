@@ -677,11 +677,9 @@ func (d *DB) installClonePlan(
 					meta.LargestSeqNumAbsolute = exciseSeqNum
 				}
 				// SyntheticSeqNum rewrites all key trailers to exciseSeqNum.
-				// Update the PointKeyBounds and RangeKeyBounds trailers to
-				// match, so assertIter (table-stats) and other bounds checks
-				// remain consistent with the rewritten trailers. Skip
-				// exclusive sentinels (SeqNumMax) which are structural
-				// markers, not real seqnums.
+				// Update PointKeyBounds and RangeKeyBounds trailers to match,
+				// so assertIter (table-stats) and other bounds checks remain
+				// consistent. Skip exclusive sentinels (SeqNumMax).
 				if meta.HasPointKeys {
 					s := meta.PointKeyBounds.Smallest()
 					l := meta.PointKeyBounds.Largest()
@@ -700,6 +698,7 @@ func (d *DB) installClonePlan(
 					}
 					meta.RangeKeyBounds.SetInternalKeyBounds(s, l)
 				}
+				meta.RecomputeOverallBoundTypes(d.cmp)
 			}
 			ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
 				Level: e.assignedLevel,

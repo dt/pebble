@@ -768,6 +768,33 @@ func (m *TableMetadata) extendOverallBounds(
 	}
 }
 
+// BoundTypePointKey and BoundTypeRangeKey are exported constants for
+// RecomputeOverallBoundTypes.
+const (
+	BoundTypePointKey = boundTypePointKey
+	BoundTypeRangeKey = boundTypeRangeKey
+)
+
+// RecomputeOverallBoundTypes re-derives boundTypeSmallest and
+// boundTypeLargest from PointKeyBounds and RangeKeyBounds. Call this
+// after modifying bound trailers (e.g. SyntheticSeqNum rewrite) to
+// ensure the overall Smallest/Largest are consistent.
+func (m *TableMetadata) RecomputeOverallBoundTypes(cmp Compare) {
+	if !m.HasPointKeys || !m.HasRangeKeys {
+		return
+	}
+	if base.InternalCompare(cmp, m.RangeKeyBounds.Smallest(), m.PointKeyBounds.Smallest()) < 0 {
+		m.boundTypeSmallest = boundTypeRangeKey
+	} else {
+		m.boundTypeSmallest = boundTypePointKey
+	}
+	if base.InternalCompare(cmp, m.RangeKeyBounds.Largest(), m.PointKeyBounds.Largest()) > 0 {
+		m.boundTypeLargest = boundTypeRangeKey
+	} else {
+		m.boundTypeLargest = boundTypePointKey
+	}
+}
+
 // Overlaps returns true if the file key range overlaps with the given user key bounds.
 func (m *TableMetadata) Overlaps(cmp Compare, bounds *base.UserKeyBounds) bool {
 	b := m.UserKeyBounds()
