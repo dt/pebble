@@ -317,6 +317,23 @@ type BlockPrefixSubstitution struct {
 	Src []byte
 	// Dst is the byte slice substituted in place of Src.
 	Dst []byte
+	// SuppressUnderlyingKeyspans, if true, instructs the sstable Reader to
+	// return a nil iterator from NewRawRangeDelIter / NewRawRangeKeyIter when
+	// reading a virtual sstable configured with this substitution. Set by
+	// VirtualClone on the cloned-virtual standIn, where the underlying physical
+	// sstable's range-del / range-key blocks are NOT the authoritative source
+	// of truth in dst space — `rewriteStraddlerFragments` writes a separate L0
+	// fragment SST whose translated fragments ARE authoritative. Surfacing the
+	// underlying physical's keyspan blocks through the substitution standIn
+	// would (a) duplicate the in-span fragments (idempotent for rangedels but
+	// wasteful), and (b) emit fragments whose End may extend past
+	// srcPrefix.PrefixEnd() (straddlers) or whose extent covers the standIn's
+	// inclusive Largest user key — the latter trips
+	// `keyspan.Truncate.nextSpanWithinBounds`'s "inclusive upper bound inside
+	// span" assertion because the standIn's bounds intentionally do NOT extend
+	// to encompass rangedels (extending them caused worse problems: the
+	// point-key iter walks unvalidated blocks past lastInSpan, etc.).
+	SuppressUnderlyingKeyspans bool
 }
 
 // IsSet returns true if the substitution is configured to strip and replace a

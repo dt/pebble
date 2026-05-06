@@ -278,6 +278,9 @@ func (r *Reader) NewRawRangeDelIter(
 	if r.rangeDelBH.Length == 0 {
 		return nil, nil
 	}
+	if env.Virtual != nil && transforms.BlockPrefixSubstitution.SuppressUnderlyingKeyspans {
+		return nil, nil
+	}
 	h, err := r.readRangeDelBlock(ctx, env.Block, noReadHandle, r.rangeDelBH)
 	if err != nil {
 		return nil, err
@@ -316,6 +319,9 @@ func (r *Reader) NewRawRangeKeyIter(
 	}
 
 	if r.rangeKeyBH.Length == 0 {
+		return nil, nil
+	}
+	if env.Virtual != nil && transforms.BlockPrefixSubstitution.SuppressUnderlyingKeyspans {
 		return nil, nil
 	}
 	h, err := r.readRangeKeyBlock(ctx, env.Block, noReadHandle, r.rangeKeyBH)

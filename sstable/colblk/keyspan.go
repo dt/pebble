@@ -763,43 +763,25 @@ func (i *keyspanIter) materializeSpan() *keyspan.Span {
 			}
 			i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(sub.Src):]...)
 		default:
-			// End is past srcPrefix. There are two sub-cases:
-			//
-			//   (1) End lies at srcPrefix.PrefixEnd() (possibly with
-			//       trailing bytes such as a cockroachkvs suffix-length
-			//       sentinel) — a fragment terminating exactly at the
-			//       prefix boundary. Translate to
-			//       dstPrefix.PrefixEnd() + the same trailing bytes;
-			//       this is the common boundary form for in-span
-			//       fragments and produces the correct dst-space End.
-			//
-			//   (2) End extends further past srcPrefix.PrefixEnd() — a
-			//       straddling fragment whose source extent reaches
-			//       into a different prefix region entirely. The
-			//       substitution map only defines a Src→Dst mapping
-			//       for srcPrefix; data past srcPrefix.PrefixEnd() is
-			//       outside the substitution's defined region. Clip
-			//       End at dstPrefix.PrefixEnd() and let the caller's
-			//       `keyspan.Truncate` (with the file's bounds) clip
-			//       further if needed. The original VirtualClone
-			//       caller is expected to materialize the truncated
-			//       (in-span) portion of any straddling fragment into
-			//       a separate fragment SST, so this clipped-on-emit
-			//       form coexists with the authoritative translated
-			//       fragment downstream.
+			// Boundary case: End must lie at srcPrefix.PrefixEnd() (with
+			// optional trailing bytes such as a cockroachkvs sentinel).
+			// Translate to dstPrefix.PrefixEnd() with the same trailing
+			// bytes preserved.
+			srcPrefixEnd := bytePrefixEnd(sub.Src)
+			if srcPrefixEnd == nil || !bytes.HasPrefix(i.span.End, srcPrefixEnd) {
+				panic(errors.AssertionFailedf(
+					"keyspanIter: span.End %q is past substitution Src %q "+
+						"and does not match Src.PrefixEnd()",
+					i.span.End, sub.Src))
+			}
 			dstPrefixEnd := bytePrefixEnd(sub.Dst)
 			if dstPrefixEnd == nil {
 				panic(errors.AssertionFailedf(
 					"keyspanIter: substitution Dst %q has no byte-prefix-end (all 0xff)",
 					sub.Dst))
 			}
-			srcPrefixEnd := bytePrefixEnd(sub.Src)
-			if srcPrefixEnd != nil && bytes.HasPrefix(i.span.End, srcPrefixEnd) {
-				i.endKeyBuf = append(i.endKeyBuf[:0], dstPrefixEnd...)
-				i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(srcPrefixEnd):]...)
-			} else {
-				i.endKeyBuf = append(i.endKeyBuf[:0], dstPrefixEnd...)
-			}
+			i.endKeyBuf = append(i.endKeyBuf[:0], dstPrefixEnd...)
+			i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(srcPrefixEnd):]...)
 		}
 		i.span.Start = i.startKeyBuf
 		i.span.End = i.endKeyBuf

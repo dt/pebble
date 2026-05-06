@@ -333,30 +333,8 @@ func TestVirtualClone_ScanInternal_RangeDelAtPrefixEnd(t *testing.T) {
 		Start: enc(append(append([]byte{}, dstPrefix...), "a"...)),
 		End:   enc([]byte{0xfe, 0x8d}),
 	}
-	preClone, err := d.SSTables()
-	require.NoError(t, err)
-	for level, files := range preClone {
-		for _, f := range files {
-			t.Logf("pre-clone L%d file=%d virtual=%v backing=%d "+
-				"smallest=%x largest=%x size=%d",
-				level, f.TableInfo.FileNum, f.Virtual, f.BackingSSTNum,
-				f.Smallest.UserKey, f.Largest.UserKey, f.Size)
-		}
-	}
-
 	require.NoError(t, d.VirtualClone(context.Background(),
 		srcSpan, srcPrefix, dstSpan, dstPrefix))
-
-	postClone, err := d.SSTables()
-	require.NoError(t, err)
-	for level, files := range postClone {
-		for _, f := range files {
-			t.Logf("post-clone L%d file=%d virtual=%v backing=%d "+
-				"smallest=%x largest=%x size=%d",
-				level, f.TableInfo.FileNum, f.Virtual, f.BackingSSTNum,
-				f.Smallest.UserKey, f.Largest.UserKey, f.Size)
-		}
-	}
 
 	visitPointKey := func(*base.InternalKey, base.LazyValue, pebble.IteratorLevel) error {
 		return nil
