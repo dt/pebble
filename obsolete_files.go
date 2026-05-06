@@ -403,12 +403,10 @@ func (z *zombieObjects) Add(obj objectInfo) {
 			obj.FileNum, errors.Safe(prior), errors.Safe(string(debug.Stack()))))
 	}
 	z.objs[obj.FileNum] = obj
-	if invariants.Enabled {
-		if z.addStacks == nil {
-			z.addStacks = make(map[base.DiskFileNum]string)
-		}
-		z.addStacks[obj.FileNum] = string(debug.Stack())
+	if z.addStacks == nil {
+		z.addStacks = make(map[base.DiskFileNum]string)
 	}
+	z.addStacks[obj.FileNum] = string(debug.Stack())
 }
 
 // AddMetadata is like Add, but takes an ObjectMetadata and the object's size.
