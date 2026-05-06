@@ -7,7 +7,6 @@ package pebble
 import (
 	"bytes"
 	"context"
-	"fmt"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -677,6 +676,30 @@ func (d *DB) installClonePlan(
 				if meta.LargestSeqNumAbsolute < exciseSeqNum {
 					meta.LargestSeqNumAbsolute = exciseSeqNum
 				}
+				// SyntheticSeqNum rewrites all key trailers to exciseSeqNum.
+				// Update the PointKeyBounds and RangeKeyBounds trailers to
+				// match, so assertIter (table-stats) and other bounds checks
+				// remain consistent with the rewritten trailers. Skip
+				// exclusive sentinels (SeqNumMax) which are structural
+				// markers, not real seqnums.
+				if meta.HasPointKeys {
+					s := meta.PointKeyBounds.Smallest()
+					l := meta.PointKeyBounds.Largest()
+					s.Trailer = base.MakeTrailer(exciseSeqNum, s.Trailer.Kind())
+					if !l.IsExclusiveSentinel() {
+						l.Trailer = base.MakeTrailer(exciseSeqNum, l.Trailer.Kind())
+					}
+					meta.PointKeyBounds.SetInternalKeyBounds(s, l)
+				}
+				if meta.HasRangeKeys {
+					s := meta.RangeKeyBounds.Smallest()
+					l := meta.RangeKeyBounds.Largest()
+					s.Trailer = base.MakeTrailer(exciseSeqNum, s.Trailer.Kind())
+					if !l.IsExclusiveSentinel() {
+						l.Trailer = base.MakeTrailer(exciseSeqNum, l.Trailer.Kind())
+					}
+					meta.RangeKeyBounds.SetInternalKeyBounds(s, l)
+				}
 			}
 			ve.NewTables = append(ve.NewTables, manifest.NewTableEntry{
 				Level: e.assignedLevel,
@@ -783,56 +806,6 @@ func (d *DB) installClonePlan(
 		var anyExcised bool
 		for layer, ls := range current.AllLevelsAndSublevels() {
 			for m := range ls.Overlaps(d.cmp, dstSpanBounds).All() {
-				// Diagnostic: a compacting table about to be excised will trip
-				// the compaction's commit with "deleted not in level" unless
-				// the cancel block below catches its owning compaction. The
-				// cancel block fires for compactions that are (a) in
-				// d.mu.compact.inProgress, (b) not VersionEditApplied, and
-				// (c) whose Bounds() overlaps dstSpan. If none of the
-				// compactions owning this file satisfy all three, the cancel
-				// block will miss it and the commit will panic. Panic now
-				// with full context instead of waiting for the deferred
-				// "deleted table not in level" panic with no diagnostic info.
-				if m.IsCompacting() {
-					var hits, willCancel int
-					var dump string
-					for c := range d.mu.compact.inProgress {
-						tc, ok := c.(*tableCompaction)
-						if !ok {
-							continue
-						}
-						var owns bool
-						for _, t := range tc.Tables() {
-							if t.TableNum == m.TableNum {
-								owns = true
-								break
-							}
-						}
-						if !owns {
-							continue
-						}
-						hits++
-						b := tc.Bounds()
-						overlaps := b != nil && b.Overlaps(d.cmp, dstSpanBounds)
-						applied := tc.VersionEditApplied()
-						if overlaps && !applied {
-							willCancel++
-						}
-						dump += fmt.Sprintf(
-							"  compaction %p: VersionEditApplied=%t bounds=%s overlapsDstSpan=%t kind=%v\n",
-							tc, applied, b, overlaps, tc.kind)
-					}
-					if willCancel == 0 {
-						panic(errors.AssertionFailedf(
-							"VirtualClone excise will delete compacting table %s "+
-								"(level=%d, bounds=%s) in dstSpan=%s but cancel block "+
-								"will miss it: owners-in-inProgress=%d, willCancel=%d\n%s",
-							errors.Safe(m.TableNum), errors.Safe(layer.Level()),
-							m.UserKeyBounds(), dstSpanBounds,
-							errors.Safe(hits), errors.Safe(willCancel),
-							errors.Safe(dump)))
-					}
-				}
 				leftTable, rightTable, err := d.exciseTable(
 					ctx, dstSpanBounds, m, layer.Level(), tightExciseBoundsIfLocal)
 				if err != nil {
@@ -899,6 +872,9 @@ func (d *DB) installClonePlan(
 	}
 	d.fireCloneEvents(int(jobID), appliedVE)
 	d.updateReadStateLocked(d.opts.DebugCheck)
+	if appliedVE != nil {
+		d.updateTableStatsLocked(appliedVE.NewTables)
+	}
 	return false, nil
 }
 
