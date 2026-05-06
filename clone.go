@@ -1167,13 +1167,41 @@ func (d *DB) buildStraddlerEntries(
 			},
 		}
 		vm.ExtendPointKeyBounds(d.cmp, smallest, largest)
-		// NB: do NOT extend the virtual SST's bounds to encompass in-span
-		// range-deletion / range-key fragments. A wide rangedel can produce
-		// bounds that overlap the boundary-rewrite physical SSTs from this
-		// same source (and the cloned virtual SST + boundary SSTs all live
-		// at the source level, where pebble forbids overlapping files).
-		// In-span fragments are materialized into a separate physical SST by
-		// rewriteStraddlerFragments and placed at L0; see below.
+		// Extend the point-key bounds to cover any in-span range-deletion
+		// fragment, translated into dst space. The underlying physical
+		// SST's range-del block is unconditionally surfaced through the
+		// substitution standIn (the colblk reader opens the rangedel
+		// block whenever it exists, and the standIn always has point
+		// keys so the rangedel-iter slot in the point-key iter stack is
+		// always populated). The emitted rangedel span can cover the
+		// standIn's largest point key — and `keyspan.Truncate` panics in
+		// `nextSpanWithinBounds` with "inclusive upper bound inside
+		// span" when the standIn's Largest is a regular (non-sentinel)
+		// point key shadowed by its own rangedel. Lifting Largest to
+		// the rangedel's translated exclusive sentinel makes the
+		// truncate bound exclusive at the rangedel's End, restoring the
+		// invariant.
+		//
+		// Note: range KEYS are NOT mirrored on the standIn. The standIn
+		// deliberately leaves `RangeKeyBounds` unset, which keeps it out
+		// of `RangeKeyLevels` — so the range-key iter is never opened on
+		// the standIn, and the dst-space view of any in-span range-key
+		// is served exclusively by the L0 fragment SST written by
+		// `rewriteStraddlerFragments`. (Mirroring range keys here would
+		// open the substitution iter on the underlying physical's
+		// keyspan block, which can hold straddling range-key fragments
+		// whose End lies far past srcPrefix.PrefixEnd() — outside the
+		// substitution's defined region.)
+		//
+		// This bounds extension is safe at L0 (where the standIn lives
+		// whenever there is an in-span fragment, because the fragment
+		// SST is forceL0=true and propagates that to all sibling
+		// entries from the same source — see `placeClonedFiles`).
+		if survey.hasInSpanRangeDel {
+			vm.ExtendPointKeyBounds(d.cmp,
+				translateBoundaryInternalKey(srcPrefix, dstPrefix, srcSpan, dstSpan, survey.smallestRangeDel),
+				translateBoundaryInternalKey(srcPrefix, dstPrefix, srcSpan, dstSpan, survey.largestRangeDel))
+		}
 
 		vm.AttachVirtualBacking(m.TableBacking)
 		// Approximate size by proportion of in-span blocks to total blocks.

@@ -656,6 +656,21 @@ func (i *keyspanIter) isNonemptySpan(startBoundIndex int) bool {
 	return i.r.boundaryKeyIndices.At(startBoundIndex) < i.r.boundaryKeyIndices.At(startBoundIndex+1)
 }
 
+// bytePrefixEnd returns the smallest byte string strictly greater than every
+// byte string having p as a bytewise prefix. It returns nil if p is empty or
+// consists entirely of 0xff bytes (in which case no such bound exists).
+func bytePrefixEnd(p []byte) []byte {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] < 0xff {
+			out := make([]byte, i+1)
+			copy(out, p[:i+1])
+			out[i]++
+			return out
+		}
+	}
+	return nil
+}
+
 // materializeSpan constructs the current span from i.startBoundIndex and
 // i.{start,end}KeyIndex.
 func (i *keyspanIter) materializeSpan() *keyspan.Span {
@@ -706,35 +721,86 @@ func (i *keyspanIter) materializeSpan() *keyspan.Span {
 		// (enforced by FragmentIterTransforms construction); take this branch
 		// in preference to the SyntheticPrefix branch below so the
 		// invariants.Sometimes path doesn't accidentally bypass substitution.
-		// The stored boundary keys include Src as their leading bytes; strip
-		// Src and prepend Dst into the pre-allocated start/end key buffers.
-		// init() pre-filled the first len(Dst) bytes with Dst, so we only need
-		// to truncate back to len(Dst) and append the post-Src tail.
+		//
+		// Start always has Src as its leading bytes (gatherKeysForward /
+		// gatherKeysBackward skip spans whose Start lies outside Src).
+		// End may instead lie at Src.PrefixEnd(): a fragment whose Start is
+		// inside srcPrefix but whose exclusive End reaches the prefix
+		// boundary — common for cockroachkvs-style RANGEKEYDEL/RANGEDEL
+		// covering [someKey, srcPrefix.PrefixEnd()) (encoded as
+		// `srcPrefix.PrefixEnd() + suffix-length sentinel`). For that End
+		// we must translate srcPrefix.PrefixEnd() → dstPrefix.PrefixEnd()
+		// (preserving any trailing bytes), not strip Src and prepend Dst —
+		// the latter produces an off-by-one (dstPrefix + tail instead of
+		// dstPrefix.PrefixEnd() + tail) that silently corrupts the End.
+		//
+		// init() pre-filled the first len(Dst) bytes of startKeyBuf/endKeyBuf
+		// with Dst, so the Src→Dst case only needs to truncate back to len(Dst)
+		// and append the post-Src tail. The boundary case for End rebuilds
+		// endKeyBuf from scratch with Dst.PrefixEnd() as its prefix.
 		dstLen := len(sub.Dst)
 		i.startKeyBuf = i.startKeyBuf[:dstLen]
-		i.endKeyBuf = i.endKeyBuf[:dstLen]
 		if invariants.Enabled {
 			if !bytes.Equal(i.startKeyBuf, sub.Dst) {
 				panic(errors.AssertionFailedf("keyspanIter: substitution Dst mismatch %q, %q",
 					i.startKeyBuf, sub.Dst))
-			}
-			if !bytes.Equal(i.endKeyBuf, sub.Dst) {
-				panic(errors.AssertionFailedf("keyspanIter: substitution Dst mismatch %q, %q",
-					i.endKeyBuf, sub.Dst))
 			}
 			if !bytes.HasPrefix(i.span.Start, sub.Src) {
 				panic(errors.AssertionFailedf(
 					"keyspanIter: span.Start %q does not have substitution Src %q",
 					i.span.Start, sub.Src))
 			}
-			if !bytes.HasPrefix(i.span.End, sub.Src) {
-				panic(errors.AssertionFailedf(
-					"keyspanIter: span.End %q does not have substitution Src %q",
-					i.span.End, sub.Src))
-			}
 		}
 		i.startKeyBuf = append(i.startKeyBuf, i.span.Start[len(sub.Src):]...)
-		i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(sub.Src):]...)
+		switch {
+		case bytes.HasPrefix(i.span.End, sub.Src):
+			// Common case: End is inside srcPrefix; reuse the Dst-prefilled
+			// buffer.
+			i.endKeyBuf = i.endKeyBuf[:dstLen]
+			if invariants.Enabled && !bytes.Equal(i.endKeyBuf, sub.Dst) {
+				panic(errors.AssertionFailedf("keyspanIter: substitution Dst mismatch %q, %q",
+					i.endKeyBuf, sub.Dst))
+			}
+			i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(sub.Src):]...)
+		default:
+			// End is past srcPrefix. There are two sub-cases:
+			//
+			//   (1) End lies at srcPrefix.PrefixEnd() (possibly with
+			//       trailing bytes such as a cockroachkvs suffix-length
+			//       sentinel) — a fragment terminating exactly at the
+			//       prefix boundary. Translate to
+			//       dstPrefix.PrefixEnd() + the same trailing bytes;
+			//       this is the common boundary form for in-span
+			//       fragments and produces the correct dst-space End.
+			//
+			//   (2) End extends further past srcPrefix.PrefixEnd() — a
+			//       straddling fragment whose source extent reaches
+			//       into a different prefix region entirely. The
+			//       substitution map only defines a Src→Dst mapping
+			//       for srcPrefix; data past srcPrefix.PrefixEnd() is
+			//       outside the substitution's defined region. Clip
+			//       End at dstPrefix.PrefixEnd() and let the caller's
+			//       `keyspan.Truncate` (with the file's bounds) clip
+			//       further if needed. The original VirtualClone
+			//       caller is expected to materialize the truncated
+			//       (in-span) portion of any straddling fragment into
+			//       a separate fragment SST, so this clipped-on-emit
+			//       form coexists with the authoritative translated
+			//       fragment downstream.
+			dstPrefixEnd := bytePrefixEnd(sub.Dst)
+			if dstPrefixEnd == nil {
+				panic(errors.AssertionFailedf(
+					"keyspanIter: substitution Dst %q has no byte-prefix-end (all 0xff)",
+					sub.Dst))
+			}
+			srcPrefixEnd := bytePrefixEnd(sub.Src)
+			if srcPrefixEnd != nil && bytes.HasPrefix(i.span.End, srcPrefixEnd) {
+				i.endKeyBuf = append(i.endKeyBuf[:0], dstPrefixEnd...)
+				i.endKeyBuf = append(i.endKeyBuf, i.span.End[len(srcPrefixEnd):]...)
+			} else {
+				i.endKeyBuf = append(i.endKeyBuf[:0], dstPrefixEnd...)
+			}
+		}
 		i.span.Start = i.startKeyBuf
 		i.span.End = i.endKeyBuf
 	} else if i.transforms.HasSyntheticPrefix() || invariants.Sometimes(10) {

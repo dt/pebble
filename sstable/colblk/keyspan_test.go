@@ -72,6 +72,53 @@ func TestKeyspanBlock(t *testing.T) {
 	})
 }
 
+// TestKeyspanIter_BlockPrefixSubstitution_EndAtPrefixEnd reproduces the
+// boundary case the higher-level VirtualClone consumer exercises: a fragment
+// whose End user-key is exactly srcPrefix.PrefixEnd() (so the End does NOT
+// have substitution Src as a prefix). The colblk substitution path strips
+// Src and prepends Dst byte-arithmetically, which is wrong for the boundary
+// case: the dst-translated End must be dstPrefix.PrefixEnd(), not
+// dstPrefix + End[len(Src):]. With invariants enabled, materializeSpan
+// asserts and panics; with invariants disabled, it silently returns wrong
+// bytes.
+func TestKeyspanIter_BlockPrefixSubstitution_EndAtPrefixEnd(t *testing.T) {
+	src := []byte("aa")
+	dst := []byte("cc") // intentionally non-adjacent so off-by-one is observable
+	// Span fully inside srcPrefix on Start, but End is exactly srcPrefix.PrefixEnd().
+	span := keyspan.Span{
+		Start: []byte("aax"),
+		End:   []byte("ab"), // = bytewise PrefixEnd of "aa"
+		Keys:  []keyspan.Key{{Trailer: base.MakeTrailer(100, base.InternalKeyKindRangeDelete)}},
+	}
+
+	var w KeyspanBlockWriter
+	w.Init(bytes.Equal)
+	w.AddSpan(span)
+	encoded := w.Finish()
+
+	var kr KeyspanDecoder
+	kr.Init(encoded)
+
+	transforms := blockiter.FragmentTransforms{
+		BlockPrefixSubstitution: blockiter.BlockPrefixSubstitution{Src: src, Dst: dst},
+	}
+	var it keyspanIter
+	it.init(base.DefaultComparer.Compare, &kr, transforms)
+	defer it.Close()
+
+	got, err := it.First()
+	require.NoError(t, err)
+	require.NotNil(t, got, "expected a span")
+
+	wantStart := []byte("ccx") // "cc" + "x" — substitution OK because Start has Src prefix
+	wantEnd := []byte("cd")    // dstPrefix.PrefixEnd() — NOT "cc" + End[2:] = "cc"
+	require.Equalf(t, wantStart, got.Start,
+		"start: got %q, want %q", got.Start, wantStart)
+	require.Equalf(t, wantEnd, got.End,
+		"end: got %q, want %q (off-by-one byte-arithmetic result would be %q)",
+		got.End, wantEnd, append(append([]byte(nil), dst...), span.End[len(src):]...))
+}
+
 // TestKeyspanBlockPooling exercises the NewKeyspanIter constructor of a
 // KeyspanIter and the Close behavior that retains keyspan iters within a pool.
 func TestKeyspanBlockPooling(t *testing.T) {
