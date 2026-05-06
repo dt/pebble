@@ -7,6 +7,7 @@ package pebble
 import (
 	"bytes"
 	"context"
+	"fmt"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/internal/base"
@@ -779,6 +780,41 @@ func (d *DB) installClonePlan(
 		var anyExcised bool
 		for layer, ls := range current.AllLevelsAndSublevels() {
 			for m := range ls.Overlaps(d.cmp, dstSpanBounds).All() {
+				// Diagnostic: a compacting table about to be excised will trip
+				// the compaction's commit with "deleted not in level" if the
+				// owning compaction's bounds heuristic does not catch it via
+				// the cancel loop below. Find the owning compaction and dump
+				// what we know so the next CRDB run pinpoints the leak.
+				if m.IsCompacting() {
+					var hits int
+					var dump string
+					for c := range d.mu.compact.inProgress {
+						tc, ok := c.(*tableCompaction)
+						if !ok {
+							continue
+						}
+						var owns bool
+						for _, t := range tc.Tables() {
+							if t.TableNum == m.TableNum {
+								owns = true
+								break
+							}
+						}
+						if !owns {
+							continue
+						}
+						hits++
+						b := tc.Bounds()
+						overlaps := b != nil && b.Overlaps(d.cmp, dstSpanBounds)
+						dump += fmt.Sprintf(
+							"  compaction %p: VersionEditApplied=%t bounds=%s overlapsDstSpan=%t kind=%v\n",
+							tc, tc.VersionEditApplied(), b, overlaps, tc.kind)
+					}
+					d.opts.Logger.Errorf(
+						"VirtualClone excise: about-to-delete compacting table %s "+
+							"(level=%d, bounds=%s) in dstSpan=%s; owners-in-inProgress=%d\n%s",
+						m.TableNum, layer.Level(), m.UserKeyBounds(), dstSpanBounds, hits, dump)
+				}
 				leftTable, rightTable, err := d.exciseTable(
 					ctx, dstSpanBounds, m, layer.Level(), tightExciseBoundsIfLocal)
 				if err != nil {
