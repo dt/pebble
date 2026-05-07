@@ -1102,8 +1102,20 @@ func newCombinedDeletionKeyspanIter(
 		//
 		// TODO(jackson): Only use AssertBounds in invariants builds in the
 		// following release.
+		lower := m.PointKeyBounds.Smallest()
+		// When SyntheticSeqNum is active, all key trailers in the SST
+		// are rewritten to the same seqnum. If a RANGEDEL starts at
+		// the same user key as a SET (the PointKeyBounds.Smallest),
+		// the RANGEDEL (kind 15) sorts before the SET (kind 1) at the
+		// same seqnum. Widen the lower bound's Kind to RANGEDEL so
+		// the assertion doesn't reject valid RANGEDEL keys that the
+		// SyntheticSeqNum rewrite placed ahead of the SET.
+		if m.SyntheticSeqNum() != 0 && lower.Kind() == base.InternalKeyKindSet {
+			lower.Trailer = base.MakeTrailer(
+				base.SeqNum(m.SyntheticSeqNum()), base.InternalKeyKindRangeDelete)
+		}
 		iter = keyspan.AssertBounds(
-			iter, m.PointKeyBounds.Smallest(), m.PointKeyBounds.LargestUserKey(), comparer.Compare,
+			iter, lower, m.PointKeyBounds.LargestUserKey(), comparer.Compare,
 		)
 		dIter := &keyspan.DefragmentingIter{}
 		dIter.Init(comparer, iter, equal, reducer, new(keyspan.DefragmentingBuffers))

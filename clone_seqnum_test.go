@@ -126,6 +126,82 @@ func TestVirtualClone_SyntheticSeqNumBoundsConsistency(t *testing.T) {
 	require.Greater(t, count, 0, "expected cloned data in dst span")
 }
 
+// TestVirtualClone_SyntheticSeqNumRangeDelAtSmallest verifies that
+// table-stats collection doesn't panic when a cloned virtual SST has
+// both a SET and a RANGEDEL starting at the same user key. After
+// SyntheticSeqNum equalizes their seqnums, the RANGEDEL (kind 15)
+// sorts before SET (kind 1) at the same seqnum, violating a
+// SET-based assertIter lower bound.
+func TestVirtualClone_SyntheticSeqNumRangeDelAtSmallest(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	mem := vfs.NewMem()
+	opts := &Options{
+		Comparer:                    &cockroachkvs.Comparer,
+		BlockPropertyCollectors:     cockroachkvs.BlockPropertyCollectors,
+		FormatMajorVersion:          FormatPrefixSubstitution,
+		FS:                          mem,
+		KeySchema:                   cockroachkvs.KeySchema.Name,
+		KeySchemas:                  sstable.MakeKeySchemas(&cockroachkvs.KeySchema),
+		DisableAutomaticCompactions: true,
+	}
+	d, err := Open("", opts)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, d.Close()) }()
+
+	enc := func(roachKey []byte) []byte {
+		return cockroachkvs.EncodeKey(nil, roachKey, nil)
+	}
+	encMVCC := func(roachKey []byte, walltime uint64) []byte {
+		ver := []byte{
+			byte(walltime >> 56), byte(walltime >> 48), byte(walltime >> 40), byte(walltime >> 32),
+			byte(walltime >> 24), byte(walltime >> 16), byte(walltime >> 8), byte(walltime),
+		}
+		return cockroachkvs.EncodeKey(nil, roachKey, ver)
+	}
+
+	srcPrefix := []byte{0xfe, 0x8b}
+	dstPrefix := []byte{0xfe, 0x8c}
+
+	startKey := append(append([]byte{}, srcPrefix...), 0x88, 0x00)
+
+	// RANGEDEL first (lower seqnum), starting at startKey.
+	require.NoError(t, d.DeleteRange(
+		enc(startKey), enc(append(append([]byte{}, srcPrefix...), 0x88, 0x10)), nil))
+	// SET at the same user key (higher seqnum). In the source, SET
+	// sorts first (higher seqnum = smaller internal key). After
+	// SyntheticSeqNum, RANGEDEL sorts first (higher kind at same seqnum).
+	require.NoError(t, d.Set(enc(startKey), []byte("v"), nil))
+	for i := 1; i < 5; i++ {
+		k := encMVCC(append(append([]byte{}, srcPrefix...), byte(0x88), byte(i)), uint64(100+i))
+		require.NoError(t, d.Set(k, []byte("v"), nil))
+	}
+	require.NoError(t, d.Flush())
+
+	// Advance seqnum.
+	for i := 0; i < 100; i++ {
+		k := encMVCC([]byte{0x01, byte(i)}, uint64(1000+i))
+		require.NoError(t, d.Set(k, []byte("padding"), nil))
+	}
+	require.NoError(t, d.Flush())
+
+	srcSpan := KeyRange{Start: enc(srcPrefix), End: enc([]byte{0xfe, 0x8c})}
+	dstSpan := KeyRange{Start: enc(dstPrefix), End: enc([]byte{0xfe, 0x8d})}
+	require.NoError(t, d.VirtualClone(context.Background(),
+		srcSpan, srcPrefix, dstSpan, dstPrefix))
+
+	// Force table-stats collection. The assertIter in
+	// loadTableRangeDelStats panics without the fix because the
+	// RANGEDEL at exciseSeqNum sorts before the SET-based lower bound.
+	for d.collectTableStats() {
+	}
+	d.mu.Lock()
+	for d.mu.tableStats.loading || len(d.mu.tableStats.pending) > 0 {
+		d.mu.tableStats.cond.Wait()
+	}
+	d.mu.Unlock()
+}
+
 // TestVirtualClone_SyntheticSeqNumOverallBounds verifies that after the
 // SyntheticSeqNum trailer rewrite, the overall bounds (Smallest/Largest)
 // are consistent with the rewritten PointKeyBounds and RangeKeyBounds.
