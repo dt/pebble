@@ -33,7 +33,7 @@ func TestVirtualClone_SyntheticSeqNumBoundsConsistency(t *testing.T) {
 	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	enc := func(roachKey []byte) []byte {
 		return cockroachkvs.EncodeKey(nil, roachKey, nil)
@@ -147,7 +147,7 @@ func TestVirtualClone_SyntheticSeqNumRangeDelAtSmallest(t *testing.T) {
 	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	enc := func(roachKey []byte) []byte {
 		return cockroachkvs.EncodeKey(nil, roachKey, nil)
@@ -222,7 +222,7 @@ func TestVirtualClone_SyntheticSeqNumOverallBounds(t *testing.T) {
 	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	enc := func(roachKey []byte) []byte {
 		return cockroachkvs.EncodeKey(nil, roachKey, nil)

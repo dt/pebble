@@ -153,6 +153,39 @@ func openCloneTestDBWithOpts(
 	return d
 }
 
+// validateAndCloseCloneTestDB validates all virtual SSTs in the DB's current
+// version (Validate + forced table-stats collection to exercise assertIter
+// bounds), then closes the DB. This catches metadata inconsistencies from
+// SyntheticSeqNum trailer rewrite, overall bound type drift, and assertIter
+// bound violations that previously only surfaced in CRDB cluster tests.
+func validateAndCloseCloneTestDB(t *testing.T, d *DB) {
+	t.Helper()
+	// Force table stats collection so loadTableRangeDelStats' assertIter
+	// runs synchronously before close. This catches the RANGEDEL-at-
+	// smallest-SET violation that CRDB hit in production.
+	for d.collectTableStats() {
+	}
+	d.mu.Lock()
+	for d.mu.tableStats.loading || len(d.mu.tableStats.pending) > 0 {
+		d.mu.tableStats.cond.Wait()
+	}
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	d.mu.Unlock()
+	for level := range v.Levels {
+		for m := range v.Levels[level].All() {
+			if !m.Virtual {
+				continue
+			}
+			if err := m.Validate(d.cmp, d.opts.Comparer.FormatKey); err != nil {
+				t.Errorf("L%d table %s: %v", level, m.TableNum, err)
+			}
+		}
+	}
+	v.Unref()
+	require.NoError(t, d.Close())
+}
+
 func setMany(t *testing.T, d *DB, keys []string, value []byte) {
 	t.Helper()
 	for _, k := range keys {
@@ -185,7 +218,7 @@ func scanRange(t *testing.T, d *DB, lower, upper []byte) []string {
 func TestVirtualClone_HappyPathSingleSST(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -225,7 +258,7 @@ func TestVirtualClone_HappyPathSingleSST(t *testing.T) {
 func TestVirtualClone_MultipleFullyContainedSSTsAcrossLevels(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -278,7 +311,7 @@ func TestVirtualClone_MultipleFullyContainedSSTsAcrossLevels(t *testing.T) {
 func TestVirtualClone_StraddlingSrcSpanLowerEnd(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -310,7 +343,7 @@ func TestVirtualClone_FormatGate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	// Open below the floor.
 	d := openCloneTestDB(t, FormatPrefixSubstitution-1)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -327,7 +360,7 @@ func TestVirtualClone_FormatGate(t *testing.T) {
 func TestVirtualClone_DestinationExcised(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -351,7 +384,7 @@ func TestVirtualClone_DestinationExcised(t *testing.T) {
 func TestVirtualClone_EmptySrcSpan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -373,7 +406,7 @@ func TestVirtualClone_EmptySrcSpan(t *testing.T) {
 func TestVirtualClone_InputValidation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -426,7 +459,7 @@ func TestVirtualClone_InputValidation(t *testing.T) {
 func TestVirtualClone_StraddlingSrcSpanUpperEnd(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -460,7 +493,7 @@ func TestVirtualClone_StraddlingSrcSpanUpperEnd(t *testing.T) {
 func TestVirtualClone_BothEndsStraddling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -514,7 +547,7 @@ func TestVirtualClone_BoundaryBlock_ValueBlockValues(t *testing.T) {
 	// boundary block; this guarantees the boundary blocks contain at least
 	// one value-block-resident value.
 	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -612,7 +645,7 @@ func TestVirtualClone_BoundaryBlock_ValueBlockValues(t *testing.T) {
 func TestVirtualClone_MixedInteriorAndStraddlers(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -664,7 +697,7 @@ func TestVirtualClone_MixedInteriorAndStraddlers(t *testing.T) {
 func TestVirtualClone_BlockPropertyFilterDisabled(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -692,7 +725,7 @@ func TestVirtualClone_BlockPropertyFilterDisabled(t *testing.T) {
 func TestVirtualClone_MemtableOnly(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -724,7 +757,7 @@ func TestVirtualClone_MemtableOnly(t *testing.T) {
 func TestVirtualClone_MixedMemtableAndLSM(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -763,7 +796,7 @@ func TestVirtualClone_MixedMemtableAndLSM(t *testing.T) {
 func TestVirtualClone_NoMemtableOverlap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -818,7 +851,7 @@ func TestVirtualClone_Race_CompactionDuringClone(t *testing.T) {
 		}
 	})
 	dRef.Store(d)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -904,7 +937,7 @@ func TestVirtualClone_Race_RetriesExhausted(t *testing.T) {
 		opts.private.testingAlwaysWaitForCleanup = true
 	})
 	dRef.Store(d)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1020,7 +1053,7 @@ func TestVirtualClone_Race_ExciseDuringClone(t *testing.T) {
 		}
 	})
 	dRef.Store(d)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1085,7 +1118,7 @@ func TestVirtualClone_Race_FlushDuringClone(t *testing.T) {
 		}
 	})
 	dRef.Store(d)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1122,7 +1155,7 @@ func TestVirtualClone_Race_ConcurrentClonesOverlappingDst(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	value := []byte("v")
 	// Two source partitions and two distinct dst partitions that share an
@@ -1188,7 +1221,7 @@ func TestVirtualClone_Race_ConcurrentClonesOverlappingDst(t *testing.T) {
 func TestVirtualClone_OrphanCleanupOnRetry(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1236,7 +1269,7 @@ func TestVirtualClone_OrphanCleanupOnRetry(t *testing.T) {
 func TestVirtualClone_TwoLevelIndex_FullyContained(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1273,7 +1306,7 @@ func TestVirtualClone_TwoLevelIndex_FullyContained(t *testing.T) {
 func TestVirtualClone_TwoLevelIndex_LowerStraddler(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1314,7 +1347,7 @@ func TestVirtualClone_TwoLevelIndex_LowerStraddler(t *testing.T) {
 func TestVirtualClone_TwoLevelIndex_UpperStraddler(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1348,7 +1381,7 @@ func TestVirtualClone_TwoLevelIndex_UpperStraddler(t *testing.T) {
 func TestVirtualClone_TwoLevelIndex_BothEnds(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1388,7 +1421,7 @@ func TestVirtualClone_TwoLevelIndex_BothEnds(t *testing.T) {
 func TestVirtualClone_TwoLevelIndex_RunCrossesSecondLevelBoundary(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBTwoLevel(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1470,7 +1503,7 @@ func scanRangeWithRangeKeys(
 func TestVirtualClone_RangeDelete_FullyInside(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1502,7 +1535,7 @@ func TestVirtualClone_RangeDelete_FullyInside(t *testing.T) {
 func TestVirtualClone_RangeKeySet_FullyInside(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1535,7 +1568,7 @@ func TestVirtualClone_RangeKeySet_FullyInside(t *testing.T) {
 func TestVirtualClone_RangeKey_FullyOutside(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1571,7 +1604,7 @@ func TestVirtualClone_RangeKey_FullyOutside(t *testing.T) {
 func TestVirtualClone_RangeKey_Straddling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1612,7 +1645,7 @@ func TestVirtualClone_RangeKey_Straddling(t *testing.T) {
 func TestVirtualClone_RangeDel_Straddling(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1661,7 +1694,7 @@ func TestVirtualClone_RangeDel_Straddling(t *testing.T) {
 func TestVirtualClone_MixedRangeKeys_InsideAndOutside(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1706,7 +1739,7 @@ func TestVirtualClone_MixedRangeKeys_InsideAndOutside(t *testing.T) {
 func TestVirtualClone_RangeKey_PointStraddler(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDBWithBlockSize(t, FormatPrefixSubstitution, 64)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -1891,7 +1924,7 @@ func TestVirtualClone_SentinelPrefixEndToEnd(t *testing.T) {
 	}
 	d, err := Open("", opts)
 	require.NoError(t, err)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	// srcPrefix = "/tenant/1/!"; the trailing '!' is the sentinel byte.
 	// dstPrefix = "/tenant/4/!"; same shape.
@@ -1935,7 +1968,7 @@ func TestVirtualClone_SentinelPrefixEndToEnd(t *testing.T) {
 func TestVirtualClone_ReproZombieBackingOnSourceCompact(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -2035,7 +2068,7 @@ func TestVirtualClone_CRDBShape_Smoke(t *testing.T) {
 	// The Close at the end must run the close-time zombie/leak check; defer
 	// it before any potentially-failing assertion so we always observe
 	// whether Close succeeds or fails.
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	// mkBigVal returns a non-trivial newest-version value. With
 	// MinimumSize=1, any non-empty value qualifies for blob-file routing,
@@ -2360,7 +2393,7 @@ func TestVirtualClone_BoundaryBlock_BlobHandleValues(t *testing.T) {
 			}
 		}
 	})
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -2449,7 +2482,7 @@ func TestVirtualClone_BoundaryBlock_MixedValueShapes(t *testing.T) {
 			}
 		}
 	})
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -2541,7 +2574,7 @@ func TestVirtualClone_FirstAndLastKey_BlobHandleEndpoints(t *testing.T) {
 			}
 		}
 	})
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
@@ -2604,7 +2637,7 @@ func TestVirtualClone_FirstAndLastKey_BlobHandleEndpoints(t *testing.T) {
 func TestVirtualClone_SourceStraddlesDstSpan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	d := openCloneTestDB(t, FormatPrefixSubstitution)
-	defer func() { require.NoError(t, d.Close()) }()
+	defer func() { validateAndCloseCloneTestDB(t, d) }()
 
 	srcPrefix := []byte("/tenant/1/")
 	dstPrefix := []byte("/tenant/4/")
