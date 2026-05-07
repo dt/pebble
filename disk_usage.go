@@ -57,6 +57,59 @@ func (d *DB) EstimateDiskUsageByBackingType(
 	return totalSize, remoteSize, externalSize, nil
 }
 
+// ExclusiveBytesInSpan returns the number of physical bytes that are
+// exclusively owned by the given key span [start, end). "Exclusive" means
+// bytes that would be freed if the span were excised from the LSM:
+//
+//   - Physical SSTs fully contained in the span: their full backing size.
+//   - Virtual SSTs fully contained in the span whose backing has a use count
+//     of 1 (no other virtual SST outside this span references the same
+//     backing): the backing's full physical size.
+//   - Virtual SSTs whose backing is shared with other virtuals outside the
+//     span contribute zero bytes (the backing cannot be freed).
+//   - SSTs that partially overlap the span are excluded (conservative: the
+//     backing straddles the boundary and cannot be freed by excising only
+//     this span).
+func (d *DB) ExclusiveBytesInSpan(start, end []byte) (uint64, error) {
+	if err := d.closed.Load(); err != nil {
+		panic(err)
+	}
+	bounds := base.UserKeyBoundsEndExclusive(start, end)
+	if !bounds.Valid(d.cmp) {
+		return 0, errors.New("invalid key-range specified (start >= end)")
+	}
+
+	d.mu.Lock()
+	v := d.mu.versions.currentVersion()
+	v.Ref()
+	vb := &d.mu.versions.latest.virtualBackings
+	var exclusive uint64
+	seenBackings := make(map[base.DiskFileNum]struct{})
+	for _, ls := range v.AllLevelsAndSublevels() {
+		for m := range ls.Overlaps(d.cmp, bounds).All() {
+			if !m.ContainedWithinSpan(d.cmp, start, end) {
+				continue
+			}
+			if !m.Virtual {
+				exclusive += m.TableBacking.Size
+				continue
+			}
+			backingNum := m.TableBacking.DiskFileNum
+			if _, ok := seenBackings[backingNum]; ok {
+				continue
+			}
+			seenBackings[backingNum] = struct{}{}
+			useCount, _ := vb.Usage(backingNum)
+			if useCount == 1 {
+				exclusive += m.TableBacking.Size
+			}
+		}
+	}
+	d.mu.Unlock()
+	v.Unref()
+	return exclusive, nil
+}
+
 // TableUsageByPlacement contains space usage information for tables, broken
 // down by where they are stored.
 //
