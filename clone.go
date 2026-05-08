@@ -146,7 +146,7 @@ func (d *DB) VirtualClone(
 	// seqnum; the abandoned ones leave a small gap in the seqnum sequence,
 	// which is harmless.
 	for attempt := 0; attempt < virtualCloneMaxRetries; attempt++ {
-		entries, preVEObjects, buildErr := d.buildClonePlan(ctx, attempt,
+		entries, preVEObjects, snapshotVersion, buildErr := d.buildClonePlan(ctx, attempt,
 			srcSpan, srcPrefix, dstSpan, dstPrefix)
 		if buildErr != nil {
 			d.cleanupClonePreVEObjects(preVEObjects)
@@ -154,7 +154,7 @@ func (d *DB) VirtualClone(
 		}
 
 		aborted, installErr := d.installClonePlanViaCommitPipeline(
-			ctx, attempt, entries, srcSpan, dstSpan)
+			ctx, attempt, entries, srcSpan, dstSpan, snapshotVersion)
 		if installErr != nil {
 			d.cleanupClonePreVEObjects(preVEObjects)
 			return installErr
@@ -179,7 +179,11 @@ func (d *DB) VirtualClone(
 // (preserving its pre-excise view); the registration is cleared after
 // AllocateSeqNum returns. Mirrors the ingest+excise pattern in DB.ingest.
 func (d *DB) installClonePlanViaCommitPipeline(
-	ctx context.Context, attempt int, entries []clonePlanEntry, srcSpan, dstSpan KeyRange,
+	ctx context.Context,
+	attempt int,
+	entries []clonePlanEntry,
+	srcSpan, dstSpan KeyRange,
+	snapshotVersion *manifest.Version,
 ) (aborted bool, _ error) {
 	var (
 		prepareErr     error
@@ -260,6 +264,26 @@ func (d *DB) installClonePlanViaCommitPipeline(
 			aborted = true
 			return
 		}
+		// Check if the LSM gained new files overlapping srcSpan since
+		// phase A's snapshot. A background flush between phase A and B
+		// could move data from memtable to L0 without triggering the
+		// abort-on-flush path (the memtable is already gone from the
+		// queue by the time prepare runs). If new srcSpan files appeared,
+		// abort and retry so phase A picks them up.
+		d.mu.Lock()
+		if curV := d.mu.versions.currentVersion(); curV != snapshotVersion {
+			srcBounds := srcSpan.UserKeyBounds()
+			for layer, ls := range curV.AllLevelsAndSublevels() {
+				for m := range ls.Overlaps(d.cmp, srcBounds).All() {
+					if !snapshotVersion.Contains(layer.Level(), m) {
+						d.mu.Unlock()
+						aborted = true
+						return
+					}
+				}
+			}
+		}
+		d.mu.Unlock()
 		a, err := d.installClonePlan(ctx, attempt, entries, srcSpan, dstSpan, seqNum)
 		aborted = a
 		installErr = err
@@ -456,7 +480,12 @@ func (d *DB) buildClonePlan(
 	srcPrefix []byte,
 	dstSpan KeyRange,
 	dstPrefix []byte,
-) (entries []clonePlanEntry, preVEObjects []base.DiskFileNum, _ error) {
+) (
+	entries []clonePlanEntry,
+	preVEObjects []base.DiskFileNum,
+	snapshotVersion *manifest.Version,
+	_ error,
+) {
 	d.mu.Lock()
 	currentVersion := d.mu.versions.currentVersion()
 	currentVersion.Ref()
@@ -496,7 +525,7 @@ func (d *DB) buildClonePlan(
 			// the cloned virtual SST's bounds.
 			survey, err := d.surveyAndValidateFragments(ctx, m, srcSpan, level)
 			if err != nil {
-				return nil, preVEObjects, err
+				return nil, preVEObjects, nil, err
 			}
 			// Fully-contained source SSTs go through buildFullyContainedVirtual,
 			// which uses BlockPrefixSubstitution to expose every key under
@@ -521,7 +550,7 @@ func (d *DB) buildClonePlan(
 			if fullyContained {
 				vm, err := d.buildFullyContainedVirtual(m, srcPrefix, dstPrefix)
 				if err != nil {
-					return nil, preVEObjects, err
+					return nil, preVEObjects, nil, err
 				}
 				entries = append(entries, clonePlanEntry{
 					sourceLevel:   level,
@@ -538,7 +567,7 @@ func (d *DB) buildClonePlan(
 				ctx, m, level, srcSpan, srcSpanBounds, srcPrefix, dstSpan, dstPrefix, survey, &blobFetcher)
 			preVEObjects = append(preVEObjects, written...)
 			if err != nil {
-				return nil, preVEObjects, err
+				return nil, preVEObjects, nil, err
 			}
 			entries = append(entries, straddlerEntries...)
 		}
@@ -599,7 +628,7 @@ func (d *DB) buildClonePlan(
 		}
 		entries[i].assignedLevel = entries[i].sourceLevel
 	}
-	return entries, preVEObjects, nil
+	return entries, preVEObjects, currentVersion, nil
 }
 
 // installClonePlan handles phase B of one VirtualClone attempt: re-validates

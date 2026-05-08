@@ -1092,9 +1092,10 @@ func TestVirtualClone_Race_ExciseDuringClone(t *testing.T) {
 }
 
 // TestVirtualClone_Race_FlushDuringClone (scenario D) verifies that a flush
-// of in-srcSpan memtable data that lands in L0 *after* the clone's snapshot
-// does not cause the clone to spuriously fail. The new L0 data must appear
-// in src space only; it must not appear in dst space.
+// of in-srcSpan memtable data that lands in L0 between the clone's version
+// snapshot and the install is detected and causes an abort+retry, so the
+// flushed data is included in the clone. This prevents missing-data bugs
+// where recent writes are visible at srcSpan but absent from dstSpan.
 func TestVirtualClone_Race_FlushDuringClone(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 
@@ -1131,18 +1132,17 @@ func TestVirtualClone_Race_FlushDuringClone(t *testing.T) {
 	srcSpan := KeyRange{Start: srcPrefix, End: []byte("/tenant/2/")}
 	require.NoError(t, d.VirtualClone(context.Background(), srcSpan, srcPrefix, dstSpanForTest(srcSpan, srcPrefix, dstPrefix), dstPrefix))
 
-	// We expect exactly one attempt: a flush into a new L0 SST does not
-	// invalidate any source backing snapshotted by the clone, and L0 always
-	// tolerates overlap on placement, so no abort/retry should occur.
-	require.Equal(t, int32(1), attempts.Load(),
-		"flush of new L0 data should not cause a clone abort")
+	// The flush added a new L0 file in srcSpan that wasn't in the
+	// snapshot → the clone should have aborted and retried.
+	require.GreaterOrEqual(t, attempts.Load(), int32(2),
+		"flush of new srcSpan L0 data should cause a clone retry")
 
-	// dst-space contains only the pre-snapshot keys, not the post-snapshot
-	// addition.
+	// dst-space contains BOTH the pre-snapshot keys AND the post-snapshot
+	// key (picked up on retry).
 	gotDst := scanRange(t, d, dstPrefix, []byte("/tenant/5/"))
-	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2"}, gotDst)
+	require.Equal(t, []string{"/tenant/4/k1", "/tenant/4/k2", "/tenant/4/post-snapshot"}, gotDst)
 
-	// src-space contains the post-snapshot key.
+	// src-space also contains the post-snapshot key.
 	require.Equal(t, []byte("post"), mustGet(t, d, "/tenant/1/post-snapshot"))
 }
 
