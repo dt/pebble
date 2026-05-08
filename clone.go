@@ -149,12 +149,14 @@ func (d *DB) VirtualClone(
 		entries, preVEObjects, snapshotVersion, buildErr := d.buildClonePlan(ctx, attempt,
 			srcSpan, srcPrefix, dstSpan, dstPrefix)
 		if buildErr != nil {
+			snapshotVersion.Unref()
 			d.cleanupClonePreVEObjects(preVEObjects)
 			return buildErr
 		}
 
 		aborted, installErr := d.installClonePlanViaCommitPipeline(
 			ctx, attempt, entries, srcSpan, dstSpan, snapshotVersion)
+		snapshotVersion.Unref()
 		if installErr != nil {
 			d.cleanupClonePreVEObjects(preVEObjects)
 			return installErr
@@ -490,7 +492,10 @@ func (d *DB) buildClonePlan(
 	currentVersion := d.mu.versions.currentVersion()
 	currentVersion.Ref()
 	d.mu.Unlock()
-	defer currentVersion.Unref()
+	// NB: do NOT defer Unref here. The caller needs snapshotVersion to
+	// remain valid until installClonePlanViaCommitPipeline's apply callback
+	// compares it against the current version. The caller is responsible
+	// for calling snapshotVersion.Unref() after install completes.
 
 	// Test hook: invoked after the version snapshot has been taken and d.mu
 	// has been released. Tests use this to inject concurrent compactions or
