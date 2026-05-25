@@ -1900,7 +1900,7 @@ remote-size
 
 lsm
 ----
-L0.0:
+L5:
   000011:[b#13,SET-b#13,SET]
 L6:
   000008:[a#0,SET-a#0,SET]
@@ -1914,7 +1914,8 @@ metrics
 LSM                             |    vtables   |   value sep   |        |   ingested   |    amp
 level       size | tables  size |  count  size |  refsz valblk |     in | tables  size |   r     w
 -----------------+--------------+--------------+---------------+--------+--------------+----------
-   L0       655B |      1  655B |      0     0 |     0B     0B |    38B |      1  655B |   1 54.24
+   L0         0B |      0    0B |      0     0 |     0B     0B |    38B |      0    0B |   0 54.24
+   L5       655B |      1  655B |      0     0 |     0B     0B |     0B |      1  655B |   1     0
    L6      1.9KB |      3 1.9KB |      0     0 |     0B     0B |    2KB |      0    0B |   1  0.95
 -----------------+--------------+--------------+---------------+--------+--------------+----------
 total      2.6KB |      4 2.6KB |      0     0 |     0B     0B |   693B |      1  655B |   2  6.81
@@ -1922,8 +1923,9 @@ total      2.6KB |      4 2.6KB |      0     0 |     0B     0B |   693B |      1
 COMPACTIONS               |     moved    |     multilevel    |     read     |       written
 level | score    ff   cff | tables  size |   top    in  read | tables  blob | tables  sstsz blobsz
 ------+-------------------+--------------+-------------------+--------------+---------------------
-   L0 |     -  0.25  0.25 |      0    0B |    0B    0B    0B |     0B    0B |      3    2KB     0B
-   L6 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |  1.8KB    0B |      3  1.9KB     0B
+   L0 |     -     0     0 |      0    0B |    0B    0B    0B |     0B    0B |      3    2KB     0B
+   L5 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
+   L6 |     -  0.83  0.83 |      0    0B |    0B    0B    0B |  1.8KB    0B |      3  1.9KB     0B
 ------+-------------------+--------------+-------------------+--------------+---------------------
 total |     -     -     - |      0    0B |    0B    0B    0B |  1.8KB    0B |      6  4.6KB     0B
 
@@ -1978,7 +1980,7 @@ COMPACTIONS
                                                                          |      blob rewrites
     est. debt |   in progress |  cancelled |   failed |    problem spans |       read |    written
 --------------+---------------+------------+----------+------------------+------------+-----------
-        2.6KB |        0 (0B) |     0 (0B) |        0 |                0 |         0B |         0B
+           0B |        0 (0B) |     0 (0B) |        0 |                0 |         0B |         0B
 
 KEYS
       range keys |       tombstones |      missized tombstones |      point dels |      range dels
@@ -2013,9 +2015,9 @@ set b 3
 
 flush
 ----
-L0.1:
-  000013:[b#14,SET-b#14,SET]
 L0.0:
+  000013:[b#14,SET-b#14,SET]
+L5:
   000011:[b#13,SET-b#13,SET]
 L6:
   000008:[a#0,SET-a#0,SET]
@@ -2029,7 +2031,8 @@ metrics
 LSM                             |    vtables   |   value sep   |        |   ingested   |    amp
 level       size | tables  size |  count  size |  refsz valblk |     in | tables  size |   r     w
 -----------------+--------------+--------------+---------------+--------+--------------+----------
-   L0      1.3KB |      2 1.3KB |      0     0 |     0B     0B |    74B |      1  655B |   2 37.14
+   L0       687B |      1  687B |      0     0 |     0B     0B |    74B |      0    0B |   1 37.14
+   L5       655B |      1  655B |      0     0 |     0B     0B |     0B |      1  655B |   1     0
    L6      1.9KB |      3 1.9KB |      0     0 |     0B     0B |    2KB |      0    0B |   1  0.95
 -----------------+--------------+--------------+---------------+--------+--------------+----------
 total      3.2KB |      5 3.2KB |      0     0 |     0B     0B |   729B |      1  655B |   3  7.47
@@ -2037,8 +2040,9 @@ total      3.2KB |      5 3.2KB |      0     0 |     0B     0B |   729B |      1
 COMPACTIONS               |     moved    |     multilevel    |     read     |       written
 level | score    ff   cff | tables  size |   top    in  read | tables  blob | tables  sstsz blobsz
 ------+-------------------+--------------+-------------------+--------------+---------------------
-   L0 |     -  0.50  0.50 |      0    0B |    0B    0B    0B |     0B    0B |      4  2.7KB     0B
-   L6 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |  1.8KB    0B |      3  1.9KB     0B
+   L0 |     -  0.25  0.25 |      0    0B |    0B    0B    0B |     0B    0B |      4  2.7KB     0B
+   L5 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
+   L6 |     -  0.66  0.66 |      0    0B |    0B    0B    0B |  1.8KB    0B |      3  1.9KB     0B
 ------+-------------------+--------------+-------------------+--------------+---------------------
 total |     -     -     - |      0    0B |    0B    0B    0B |  1.8KB    0B |      7  5.3KB     0B
 
@@ -2093,7 +2097,7 @@ COMPACTIONS
                                                                          |      blob rewrites
     est. debt |   in progress |  cancelled |   failed |    problem spans |       read |    written
 --------------+---------------+------------+----------+------------------+------------+-----------
-        3.2KB |        0 (0B) |     0 (0B) |        0 |                0 |         0B |         0B
+        1.3KB |        0 (0B) |     0 (0B) |        0 |                0 |         0B |         0B
 
 KEYS
       range keys |       tombstones |      missized tombstones |      point dels |      range dels
@@ -2134,7 +2138,8 @@ metrics zero-cache-hits-misses zero-delete-pacer
 LSM                             |    vtables   |   value sep   |        |   ingested   |    amp
 level       size | tables  size |  count  size |  refsz valblk |     in | tables  size |   r     w
 -----------------+--------------+--------------+---------------+--------+--------------+----------
-   L0      1.3KB |      2 1.3KB |      0     0 |     0B     0B |     0B |      0    0B |   2     0
+   L0       687B |      1  687B |      0     0 |     0B     0B |     0B |      0    0B |   1     0
+   L5       655B |      1  655B |      0     0 |     0B     0B |     0B |      0    0B |   1     0
    L6      1.9KB |      3 1.9KB |      0     0 |     0B     0B |     0B |      0    0B |   1     0
 -----------------+--------------+--------------+---------------+--------+--------------+----------
 total      3.2KB |      5 3.2KB |      0     0 |     0B     0B |     0B |      0    0B |   3     0
@@ -2142,8 +2147,9 @@ total      3.2KB |      5 3.2KB |      0     0 |     0B     0B |     0B |      0
 COMPACTIONS               |     moved    |     multilevel    |     read     |       written
 level | score    ff   cff | tables  size |   top    in  read | tables  blob | tables  sstsz blobsz
 ------+-------------------+--------------+-------------------+--------------+---------------------
-   L0 |     -  0.50  0.50 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
-   L6 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
+   L0 |     -  0.25  0.25 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
+   L5 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
+   L6 |     -  0.66  0.66 |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
 ------+-------------------+--------------+-------------------+--------------+---------------------
 total |     -     -     - |      0    0B |    0B    0B    0B |     0B    0B |      0     0B     0B
 
@@ -2195,7 +2201,7 @@ COMPACTIONS
                                                                          |      blob rewrites
     est. debt |   in progress |  cancelled |   failed |    problem spans |       read |    written
 --------------+---------------+------------+----------+------------------+------------+-----------
-        3.2KB |        0 (0B) |     0 (0B) |        0 |                0 |         0B |         0B
+        1.3KB |        0 (0B) |     0 (0B) |        0 |                0 |         0B |         0B
 
 KEYS
       range keys |       tombstones |      missized tombstones |      point dels |      range dels
@@ -2228,7 +2234,7 @@ compact a-z
 ----
 L6:
   000008:[a#0,SET-a#0,SET]
-  000018:[b#0,SET-b#0,SET]
+  000019:[b#0,SET-b#0,SET]
   000010:[c#0,SET-c#0,SET]
 
 # All tables are local after compaction.
@@ -2238,19 +2244,21 @@ metrics zero-cache-hits-misses zero-delete-pacer
 LSM                             |    vtables   |   value sep   |        |   ingested   |    amp
 level       size | tables  size |  count  size |  refsz valblk |     in | tables  size |   r     w
 -----------------+--------------+--------------+---------------+--------+--------------+----------
-   L6      1.9KB |      3 1.9KB |      0     0 |     0B     0B |  1.3KB |      0    0B |   1  0.51
+   L5         0B |      0    0B |      0     0 |     0B     0B |   687B |      0    0B |   0  1.00
+   L6      1.9KB |      3 1.9KB |      0     0 |     0B     0B |   687B |      0    0B |   1  0.99
 -----------------+--------------+--------------+---------------+--------+--------------+----------
 total      1.9KB |      3 1.9KB |      0     0 |     0B     0B |     0B |      0    0B |   1     0
 
 COMPACTIONS               |     moved    |     multilevel    |     read     |       written
 level | score    ff   cff | tables  size |   top    in  read | tables  blob | tables  sstsz blobsz
 ------+-------------------+--------------+-------------------+--------------+---------------------
-   L6 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |   342B    0B |      1   682B     0B
+   L5 |     -     0     0 |      0    0B |    0B    0B    0B |   227B    0B |      1   687B     0B
+   L6 |     -  0.00  0.00 |      0    0B |    0B    0B    0B |   721B    0B |      1   682B     0B
 ------+-------------------+--------------+-------------------+--------------+---------------------
-total |     -     -     - |      0    0B |    0B    0B    0B |   342B    0B |      1   682B     0B
+total |     -     -     - |      0    0B |    0B    0B    0B |   948B    0B |      2  1.3KB     0B
 
  kind | default  delete  elision  move  read  tomb  rewrite  copy  multi  blob virtual
-count |       1       0        0     0     0     0        0     0      0     0       0
+count |       2       0        0     0     0     0        0     0      0     0       0
 
 COMMIT PIPELINE
                wals                |              memtables              |       ingestions
@@ -2312,7 +2320,8 @@ COMPRESSION
         Logical bytes compressed / decompressed
 level |  data blocks   |  value blocks  |  other blocks
 ------+----------------+----------------+---------------
-L0-L4 |    0B / 87B    |    0B / 0B     |   0B / 5.9KB
+L0-L4 |    0B / 87B    |    0B / 0B     |   0B / 6.5KB
+   L5 |   87B / 87B    |    0B / 0B     |   676B / 0B
    L6 |    79B / 0B    |    0B / 0B     |   664B / 0B
 
 DELETE PACER   |   in queue   |   deleted
@@ -2322,7 +2331,7 @@ DELETE PACER   |   in queue   |   deleted
    other files |    0 (0B)    |    0 (0B)
 
 Iter category stats:
-   pebble-compaction, non-latency: {BlockBytes:342 BlockBytesInCache:0 BlockReadDuration:30ms}
+   pebble-compaction, non-latency: {BlockBytes:948 BlockBytesInCache:0 BlockReadDuration:50ms}
 ----
 ----
 

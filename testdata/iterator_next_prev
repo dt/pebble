@@ -14,7 +14,7 @@ del-range b c
 
 ingest ext2
 ----
-L0.0:
+L5:
   000005:[b#11,RANGEDEL-c#inf,RANGEDEL]
 L6:
   000004:[a#10,MERGE-c#10,SET]
@@ -65,7 +65,7 @@ del-range x y
 
 ingest ext2
 ----
-L0.0:
+L5:
   000005:[x#11,RANGEDEL-y#inf,RANGEDEL]
 L6:
   000004:[t#10,SET-z#10,MERGE]

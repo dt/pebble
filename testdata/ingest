@@ -157,7 +157,7 @@ ingest ext1
 
 lsm
 ----
-L0.0:
+L5:
   000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
@@ -187,9 +187,9 @@ ingest ext2
 
 lsm
 ----
-L0.1:
+L4:
   000007:[a#12,SET-c#12,SET]
-L0.0:
+L5:
   000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
@@ -222,11 +222,11 @@ ingest ext3
 
 lsm
 ----
-L0.2:
+L3:
   000008:[b#13,MERGE-c#13,DEL]
-L0.1:
+L4:
   000007:[a#12,SET-c#12,SET]
-L0.0:
+L5:
   000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
@@ -259,11 +259,11 @@ ingest ext4
 
 lsm
 ----
-L0.2:
+L3:
   000008:[b#13,MERGE-c#13,DEL]
-L0.1:
+L4:
   000007:[a#12,SET-c#12,SET]
-L0.0:
+L5:
   000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
@@ -302,14 +302,16 @@ memtable flushed
 
 lsm
 ----
-L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000009:[x#14,SET-y#14,SET]
@@ -343,14 +345,16 @@ ingest ext6
 
 lsm
 ----
-L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000014:[n#19,SET-n#19,SET]
@@ -374,17 +378,19 @@ memtable flushed
 
 lsm
 ----
-L0.3:
-  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
+  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
   000018:[m#18,SET-m#18,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000014:[n#19,SET-n#19,SET]
@@ -418,7 +424,7 @@ num-entries: 2
 num-deletions: 2
 num-range-key-sets: 0
 point-deletions-bytes-estimate: 0
-range-deletions-bytes-estimate: 1124
+range-deletions-bytes-estimate: 1958
 
 # A set operation takes precedence over a range deletion at the same
 # sequence number as can occur during ingestion.
@@ -452,20 +458,22 @@ ingest ext9
 
 lsm
 ----
-L0.4:
+L0.3:
   000020:[a#22,SET-g#22,SET]
   000019:[j#21,RANGEDEL-m#21,SET]
-L0.3:
-  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
+  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
   000018:[m#18,SET-m#18,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000014:[n#19,SET-n#19,SET]
@@ -505,20 +513,22 @@ d:40
 
 lsm
 ----
-L0.4:
+L0.3:
   000020:[a#22,SET-g#22,SET]
   000019:[j#21,RANGEDEL-m#21,SET]
-L0.3:
-  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
+  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
   000018:[m#18,SET-m#18,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000022:[d#23,SET-d#23,SET]
@@ -538,20 +548,22 @@ ingest ext13
 
 lsm
 ----
-L0.4:
+L0.3:
   000020:[a#22,SET-g#22,SET]
   000019:[j#21,RANGEDEL-m#21,SET]
-L0.3:
-  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
+  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
   000018:[m#18,SET-m#18,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000022:[d#23,SET-d#23,SET]
@@ -577,24 +589,26 @@ memtable flushed
 
 lsm
 ----
-L0.6:
-  000025:[b#28,SET-b#28,SET]
 L0.5:
-  000028:[a#27,RANGEDEL-d#inf,RANGEDEL]
+  000025:[b#28,SET-b#28,SET]
 L0.4:
+  000028:[a#27,RANGEDEL-d#inf,RANGEDEL]
+L0.3:
   000020:[a#22,SET-g#22,SET]
   000019:[j#21,RANGEDEL-m#21,SET]
-L0.3:
-  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.2:
-  000008:[b#13,MERGE-c#13,DEL]
+  000015:[a#20,RANGEDEL-z#inf,RANGEDEL]
 L0.1:
-  000007:[a#12,SET-c#12,SET]
   000010:[k#17,SET-k#17,SET]
 L0.0:
-  000006:[a#11,SET-b#11,DEL]
   000013:[j#15,SET-k#16,SET]
   000018:[m#18,SET-m#18,SET]
+L3:
+  000008:[b#13,MERGE-c#13,DEL]
+L4:
+  000007:[a#12,SET-c#12,SET]
+L5:
+  000006:[a#11,SET-b#11,DEL]
 L6:
   000005:[a#10,SET-b#10,SET]
   000022:[d#23,SET-d#23,SET]
@@ -670,7 +684,7 @@ ingest ext18
 
 lsm
 ----
-L0.0:
+L5:
   000005:[a#11,SET-c#11,SET]
 L6:
   000004:[a#10,RANGEDEL-b#inf,RANGEDEL]
@@ -704,7 +718,7 @@ ingest ext21
 
 lsm
 ----
-L0.0:
+L5:
   000006:[c#12,SET-c#12,SET]
 L6:
   000005:[a#11,SET-b#11,SET]
@@ -733,7 +747,7 @@ ingest ext23
 
 lsm
 ----
-L0.0:
+L5:
   000005:[a#11,SET-b#11,SET]
 L6:
   000004:[a#10,RANGEDEL-b#inf,RANGEDEL]
@@ -760,7 +774,7 @@ ingest ext25
 
 lsm
 ----
-L0.0:
+L5:
   000005:[a#11,RANGEDEL-b#inf,RANGEDEL]
 L6:
   000004:[a#10,RANGEDEL-b#inf,RANGEDEL]
@@ -794,7 +808,7 @@ ingest ext2
 
 lsm
 ----
-L0.0:
+L5:
   000005:[b#11,RANGEKEYSET-e#inf,RANGEKEYSET]
 L6:
   000004:[d#10,RANGEKEYSET-g#inf,RANGEKEYSET]
@@ -810,9 +824,9 @@ ingest ext3
 # Without the fix in #2082 we would expect ext3 file to be ingested into L6.
 lsm
 ----
-L0.1:
+L4:
   000006:[a#12,RANGEKEYDEL-c#inf,RANGEKEYDEL]
-L0.0:
+L5:
   000005:[b#11,RANGEKEYSET-e#inf,RANGEKEYSET]
 L6:
   000004:[d#10,RANGEKEYSET-g#inf,RANGEKEYSET]
@@ -827,11 +841,11 @@ ingest ext4
 
 lsm
 ----
-L0.2:
+L3:
   000007:[a#13,SET-a#13,SET]
-L0.1:
+L4:
   000006:[a#12,RANGEKEYDEL-c#inf,RANGEKEYDEL]
-L0.0:
+L5:
   000005:[b#11,RANGEKEYSET-e#inf,RANGEKEYSET]
 L6:
   000004:[d#10,RANGEKEYSET-g#inf,RANGEKEYSET]
@@ -844,9 +858,11 @@ compact a aa
 # get elided as it would be in L6 beneath the b-e range key in L0.
 lsm
 ----
+L5:
+  000009:[a#13,SET-e#inf,RANGEKEYSET]
 L6:
-  000008:[a#0,SET-g#inf,RANGEKEYSET]
-Range key set regions: [c, g)=1
+  000004:[d#10,RANGEKEYSET-g#inf,RANGEKEYSET]
+Range key set regions: [c, d)=1 [d, e)=2 [e, g)=1
 
 # Shouldn't show results for the b-c range as it must be deleted.
 iter
@@ -1039,7 +1055,7 @@ ingest ext12
 
 lsm
 ----
-L0.0:
+L5:
   000008:[c#12,SET-e#12,SET]
 L6:
   000006(000004):[a#10,SET-a#10,SET]
@@ -1059,7 +1075,7 @@ ingest ext13
 
 lsm
 ----
-L0.0:
+L5:
   000008:[c#12,SET-e#12,SET]
 L6:
   000006(000004):[a#10,SET-a#10,SET]
@@ -1093,10 +1109,10 @@ ingest ext14
 
 lsm
 ----
-L0.1:
+L5:
+  000013(000008):[c#12,SET-c#12,SET]
   000012:[d#14,SET-dd#14,SET]
-L0.0:
-  000008:[c#12,SET-e#12,SET]
+  000014(000008):[e#12,SET-e#12,SET]
 L6:
   000006(000004):[a#10,SET-a#10,SET]
   000010(000005):[b#11,SET-b#11,SET]

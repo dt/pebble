@@ -2167,10 +2167,16 @@ func TestIngestTargetLevel(t *testing.T) {
 		case "target":
 			var buf bytes.Buffer
 			suggestSplit := false
+			baseLevel := 1
 			for _, cmd := range td.CmdArgs {
 				switch cmd.Key {
 				case "suggest-split":
 					suggestSplit = true
+				case "base-level":
+					require.Len(t, cmd.Vals, 1)
+					var err error
+					baseLevel, err = strconv.Atoi(cmd.Vals[0])
+					require.NoError(t, err)
 				}
 			}
 			for target := range crstrings.LinesSeq(td.Input) {
@@ -2190,7 +2196,7 @@ func TestIngestTargetLevel(t *testing.T) {
 					return err.Error()
 				}
 				level, overlapFile, err := ingestTargetLevel(
-					context.Background(), d.cmp, lsmOverlap, 1, d.mu.compact.inProgress, meta, suggestSplit)
+					context.Background(), d.cmp, lsmOverlap, baseLevel, d.mu.compact.inProgress, meta, suggestSplit)
 				if err != nil {
 					return err.Error()
 				}
@@ -2652,7 +2658,7 @@ func TestConcurrentIngestCompact(t *testing.T) {
 			ingest("c")
 
 			expectLSM(`
-L0.0:
+L5:
   000005:[a#11,SET-a#11,SET]
   000007:[c#13,SET-c#13,SET]
 L6:
@@ -2660,10 +2666,10 @@ L6:
   000006:[c#12,SET-c#12,SET]
 `)
 
-			// At this point ingestion of an sstable containing only key "b" will be
-			// targeted at L6. Yet a concurrent compaction of sstables 5 and 7 will
-			// create a new sstable in L6 spanning ["a"-"c"]. So the ingestion must
-			// actually target L5.
+			// At this point ingestion of an sstable containing only key "b" would
+			// be targeted at L6. Yet a concurrent compaction of sstables 5 and 7
+			// will create a new sstable in L6 spanning ["a"-"c"]. So the
+			// ingestion must avoid L6 and target L5 instead.
 
 			switch i {
 			case 0:
@@ -2679,7 +2685,7 @@ L6:
 				compact("a", "z")
 
 				expectLSM(`
-L0.0:
+L5:
   000009:[b#14,SET-b#14,SET]
 L6:
   000008:[a#0,SET-c#0,SET]
@@ -2782,9 +2788,9 @@ func TestIngestStats(t *testing.T) {
 		require.Less(t, uint64(0), stats.Bytes)
 	}
 	ingest(6, "a")
-	ingest(0, "a")
+	ingest(5, "a")
 	ingest(6, "b", "g")
-	ingest(0, "c")
+	ingest(5, "c")
 	require.NoError(t, d.Close())
 }
 

@@ -1217,7 +1217,15 @@ func ingestTargetLevel(
 	targetLevel = 0
 	splitFile = nil
 	metaBounds := meta.UserKeyBounds()
-	for level := baseLevel; level < numLevels; level++ {
+	// NB: we start the loop at level 1 rather than baseLevel. If we started at
+	// baseLevel and the first iteration saw data overlap, we would return the
+	// initial targetLevel of 0 without considering the empty intermediate
+	// levels 1..baseLevel-1. In a small LSM that receives a sequence of ingests
+	// with overlapping bounds (e.g. online restore linking external files from
+	// successive incremental backups), this would cause every ingest after the
+	// first to pile into L0 instead of cascading into the empty levels above
+	// baseLevel.
+	for level := 1; level < numLevels; level++ {
 		var candidateSplitFile *manifest.TableMetadata
 		switch lsmOverlap[level].Result {
 		case overlap.Data:
