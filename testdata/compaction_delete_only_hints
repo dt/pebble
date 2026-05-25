@@ -348,7 +348,7 @@ OK
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[a#19,RANGEDEL-z#inf,RANGEKEYDEL]
 L6:
   XXXXXX:[a#10,RANGEKEYSET-c#10,SET]
@@ -479,7 +479,7 @@ OK
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[b#12,RANGEDEL-r#inf,RANGEDEL]
 L6:
   XXXXXX:[d#11,SET-i#11,SET]
@@ -505,7 +505,7 @@ Compactions:
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[b#12,RANGEDEL-r#inf,RANGEDEL]
 L6:
   XXXXXX:[k#10,RANGEKEYSET-o#10,SET]
@@ -544,7 +544,7 @@ OK
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[b#11,RANGEKEYDEL-p#inf,RANGEDEL]
 L6:
   XXXXXX:[k#10,RANGEKEYSET-o#10,SET]
@@ -575,7 +575,7 @@ Compactions:
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[b#11,RANGEKEYDEL-p#inf,RANGEDEL]
 L6:
   XXXXXX:[l#10,RANGEKEYSET-m#inf,RANGEKEYSET]
@@ -615,7 +615,7 @@ OK
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[l#11,RANGEKEYDEL-m#inf,RANGEDEL]
 L6:
   XXXXXX:[k#10,RANGEKEYSET-o#10,SET]
@@ -644,7 +644,7 @@ Compactions:
 
 describe-lsm
 ----
-L0.0:
+L5:
   XXXXXX:[l#11,RANGEKEYDEL-m#inf,RANGEDEL]
 L6:
   XXXXXX:[k#10,RANGEKEYSET-o#10,SET]

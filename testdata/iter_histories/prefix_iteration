@@ -298,7 +298,7 @@ range-key-set d e @1 bar
 
 lsm
 ----
-L0.0:
+L5:
   000006:[a#12,SET-d#inf,RANGEDEL]
   000007:[d#13,RANGEKEYSET-e#inf,RANGEKEYSET]
 L6:

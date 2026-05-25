@@ -1720,6 +1720,13 @@ func TestMemtableIngestInversion(t *testing.T) {
 			t.Fatal("did not get blocked on an LBase compaction")
 		default:
 			require.NoError(t, d.Set([]byte("b"), []byte("foo"), nil))
+			// Include "bb" and "cc" in the L0 flushes so that the subsequent
+			// ingests of files with those keys see L0 data overlap and take the
+			// L0 fast-path in ingestTargetLevel. Without these, the ingests
+			// would cascade into the empty intermediate levels (L1..L5) and the
+			// L0 sublevel pile-up that this test depends on would never form.
+			require.NoError(t, d.Set([]byte("bb"), []byte("foo"), nil))
+			require.NoError(t, d.Set([]byte("cc"), []byte("foo"), nil))
 			require.NoError(t, d.Set([]byte("g"), []byte("bar"), nil))
 			require.NoError(t, d.Flush())
 			time.Sleep(100 * time.Millisecond)

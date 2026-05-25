@@ -50,7 +50,7 @@ blobs: blob2
 
 ingest ext3=blob2
 ----
-L0.0:
+L5:
   000013:[a#12,SET-z#12,SET] seqnums:[#12-#12] points:[a#12,SET-z#12,SET] size:760 blobrefs:[(B000014: 4); depth:1]
 L6:
   000009:[a#10,SET-j#inf,RANGEKEYSET] seqnums:[#10-#10] points:[a#10,SET-b#10,SET] ranges:[e#10,RANGEKEYSET-j#inf,RANGEKEYSET] size:876 blobrefs:[(B000010: 4); depth:1]
@@ -81,9 +81,10 @@ blobs: blob4
 
 ingest ext4=blob3 ext5=blob4 excise-span=m-o
 ----
-L0.0:
-  000019(000013):[a#12,SET-a#12,SET] seqnums:[#12-#12] points:[a#12,SET-a#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
+L4:
   000015:[m#14,SET-o#14,SET] seqnums:[#14-#14] points:[m#14,SET-o#14,SET] size:769 blobrefs:[(B000016: 30); depth:1]
+L5:
+  000019(000013):[a#12,SET-a#12,SET] seqnums:[#12-#12] points:[a#12,SET-a#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
   000020(000013):[z#12,SET-z#12,SET] seqnums:[#12-#12] points:[z#12,SET-z#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
 L6:
   000009:[a#10,SET-j#inf,RANGEKEYSET] seqnums:[#10-#10] points:[a#10,SET-b#10,SET] ranges:[e#10,RANGEKEYSET-j#inf,RANGEKEYSET] size:876 blobrefs:[(B000010: 4); depth:1]
@@ -107,9 +108,10 @@ blobs: blob5
 
 ingest ext6=blob5 excise-span=p-q
 ----
-L0.0:
-  000019(000013):[a#12,SET-a#12,SET] seqnums:[#12-#12] points:[a#12,SET-a#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
+L4:
   000015:[m#14,SET-o#14,SET] seqnums:[#14-#14] points:[m#14,SET-o#14,SET] size:769 blobrefs:[(B000016: 30); depth:1]
+L5:
+  000019(000013):[a#12,SET-a#12,SET] seqnums:[#12-#12] points:[a#12,SET-a#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
   000022:[x#17,SET-y#17,SET] seqnums:[#17-#17] points:[x#17,SET-y#17,SET] size:749 blobrefs:[(B000023: 24); depth:1]
   000020(000013):[z#12,SET-z#12,SET] seqnums:[#12-#12] points:[z#12,SET-z#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
 L6:
@@ -139,11 +141,12 @@ blobs:
 
 ingest ext7
 ----
-L0.1:
+L3:
   000024:[l#18,RANGEKEYSET-r#18,SET] seqnums:[#18-#18] points:[p#18,SET-r#18,SET] ranges:[l#18,RANGEKEYSET-m#inf,RANGEKEYSET] size:782
-L0.0:
-  000019(000013):[a#12,SET-a#12,SET] seqnums:[#12-#12] points:[a#12,SET-a#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
+L4:
   000015:[m#14,SET-o#14,SET] seqnums:[#14-#14] points:[m#14,SET-o#14,SET] size:769 blobrefs:[(B000016: 30); depth:1]
+L5:
+  000019(000013):[a#12,SET-a#12,SET] seqnums:[#12-#12] points:[a#12,SET-a#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
   000022:[x#17,SET-y#17,SET] seqnums:[#17-#17] points:[x#17,SET-y#17,SET] size:749 blobrefs:[(B000023: 24); depth:1]
   000020(000013):[z#12,SET-z#12,SET] seqnums:[#12-#12] points:[z#12,SET-z#12,SET] size:100(760) blobrefs:[(B000014: 1/4); depth:1]
 L6:

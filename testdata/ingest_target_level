@@ -343,3 +343,41 @@ target
 000000:[i#5,RANGEDEL-j#inf,RANGEDEL] seqnums:[#5-#5]
 ----
 6
+
+# Regression: in a small LSM where the compaction picker has selected a
+# baseLevel > 1 (because the only data lives near the bottom), a sequence of
+# ingests with identical bounds must still cascade through empty intermediate
+# levels rather than piling into L0. Previously the loop started at baseLevel,
+# so data overlap on the first iteration returned the initial targetLevel of
+# 0 without considering L1..baseLevel-1.
+
+define
+L6
+  a#10,SET:10
+----
+L6:
+  000004:[a#10,SET-a#10,SET]
+
+# baseLevel=6 mimics a small LSM where the picker hasn't "opened" L1..L5 yet.
+# With the fix the ingest cascades to L5; previously it would return 0.
+target base-level=6
+000000:[a#11,SET-a#11,SET] seqnums:[#11-#11]
+----
+5
+
+define
+L5
+  a#11,SET:11
+L6
+  a#10,SET:10
+----
+L5:
+  000004:[a#11,SET-a#11,SET]
+L6:
+  000005:[a#10,SET-a#10,SET]
+
+# baseLevel=5: data overlap at L5 must still let us fall back to L4, not L0.
+target base-level=5
+000000:[a#12,SET-a#12,SET] seqnums:[#12-#12]
+----
+4
